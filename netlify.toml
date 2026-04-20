@@ -1,0 +1,11 @@
+# Netlify deployment config.
+#
+# The Next.js app lives in app/, not at the repo root — `base` tells Netlify
+# to chdir there before running the build. `publish` is relative to `base`,
+# so "out" resolves to app/out/, which is where `next build` writes the
+# fully-static export (output: 'export' in next.config.mjs).
+
+[build]
+  base = "app"
+  command = "npm run build"
+  publish = "out"
