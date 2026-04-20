@@ -33,8 +33,8 @@ export const LABEL_COLORS: Record<string, string> = {
 };
 
 export const EDGE_COLORS: Record<string, string> = {
-  hasChild: '#bdc3c7',
-  hasPart: '#7f8c8d',
+  hasChild: '#8a98a6',
+  hasPart: '#627387',
   hasEducationalAlignment: '#3498db',
   supports: '#9b59b6',
   hasStandardAlignment: '#e74c3c',
@@ -197,10 +197,10 @@ function buildVisEdge(e: GraphEdge) {
     id: e.id,
     from: e.source,
     to: e.target,
-    color: { color: EDGE_COLORS[e.label] || '#ccc', opacity: 0.65 },
+    color: { color: EDGE_COLORS[e.label] || '#c4ccd4', opacity: 0.9 },
     title: e.label,
     arrows: 'to',
-    width: e.label === 'hasChild' ? 0.6 : 1.2,
+    width: e.label === 'hasChild' ? 1.2 : 1.6,
     smooth: false,
   };
 }
@@ -213,7 +213,6 @@ type Props = {
   loading?: boolean;
   onSelectNode?: (n: GraphNode | null) => void;
   onToggleChildren?: (id: string) => void;
-  onExpandSubtree?: (id: string) => void;
 };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -229,7 +228,6 @@ export default function GraphViewer({
   loading,
   onSelectNode,
   onToggleChildren,
-  onExpandSubtree,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const networkRef = useRef<VisNetwork | null>(null);
@@ -240,8 +238,8 @@ export default function GraphViewer({
   const [visModule, setVisModule] = useState<VisModule | null>(null);
 
   // Keep a stable ref to callbacks so we bind event handlers only once.
-  const callbacksRef = useRef({ onSelectNode, onToggleChildren, onExpandSubtree, nodes });
-  callbacksRef.current = { onSelectNode, onToggleChildren, onExpandSubtree, nodes };
+  const callbacksRef = useRef({ onSelectNode, onToggleChildren, nodes });
+  callbacksRef.current = { onSelectNode, onToggleChildren, nodes };
 
   // Dynamic-import vis-network on the client only.
   useEffect(() => {
@@ -305,16 +303,8 @@ export default function GraphViewer({
     // physics on for a short pulse whenever new nodes appear and turns it back
     // off once stabilization finishes.
 
-    // Distinguish click vs double-click: schedule the click action; cancel if a
-    // double-click fires within 260 ms.
-    let clickTimer: ReturnType<typeof setTimeout> | null = null;
-    const clearClickTimer = () => {
-      if (clickTimer) {
-        clearTimeout(clickTimer);
-        clickTimer = null;
-      }
-    };
-
+    // Single click: select the node (detail pane). Double click: toggle
+    // expand/collapse of its children.
     network.on('selectNode', (ev: { nodes: string[] }) => {
       const id = ev.nodes[0];
       if (!id) return;
@@ -323,25 +313,13 @@ export default function GraphViewer({
     });
     network.on('deselectNode', () => callbacksRef.current.onSelectNode?.(null));
 
-    network.on('click', (ev: { nodes: string[] }) => {
-      const id = ev.nodes[0];
-      if (!id) return;
-      clearClickTimer();
-      clickTimer = setTimeout(() => {
-        clickTimer = null;
-        callbacksRef.current.onToggleChildren?.(id);
-      }, 260);
-    });
-
     network.on('doubleClick', (ev: { nodes: string[] }) => {
-      clearClickTimer();
       const id = ev.nodes[0];
       if (!id) return;
-      callbacksRef.current.onExpandSubtree?.(id);
+      callbacksRef.current.onToggleChildren?.(id);
     });
 
     return () => {
-      clearClickTimer();
       network.destroy();
       networkRef.current = null;
       nodesDsRef.current = null;
@@ -392,14 +370,32 @@ export default function GraphViewer({
       }
     }
 
-    // Seed new nodes in a ring around their existing parent so the physics
-    // pulse has very little work to do.
+    // Seed new nodes. Most children seed close to their parent (18–30 px) so
+    // the physics bloom is visible; LearningComponents get a much larger
+    // radius pointing AWAY from the current graph centroid so they drop
+    // outside the existing visible cluster instead of piling on top of it.
     const siblingCount = new Map<string, number>();
     const siblingIdx = new Map<string, number>();
     for (const n of added) {
       const parentId = parentMap.get(n.id as string);
       if (parentId) siblingCount.set(parentId, (siblingCount.get(parentId) ?? 0) + 1);
     }
+
+    // Centroid of currently-placed (existing) nodes — used to push outlier
+    // kinds (LearningComponent) outward.
+    const existingArr = [...existing];
+    let centroidX = 0;
+    let centroidY = 0;
+    if (existingArr.length) {
+      const poses = net.getPositions(existingArr);
+      for (const id of existingArr) {
+        centroidX += poses[id]?.x ?? 0;
+        centroidY += poses[id]?.y ?? 0;
+      }
+      centroidX /= existingArr.length;
+      centroidY /= existingArr.length;
+    }
+
     const seedUpdates: Array<{ id: string; x: number; y: number }> = [];
     for (const n of added) {
       const id = n.id as string;
@@ -410,13 +406,32 @@ export default function GraphViewer({
       const siblings = siblingCount.get(parentId) ?? 1;
       const idx = siblingIdx.get(parentId) ?? 0;
       siblingIdx.set(parentId, idx + 1);
-      const radius = 80 + Math.min(160, siblings * 10);
-      const angle = (idx / siblings) * Math.PI * 2;
-      seedUpdates.push({
-        id,
-        x: pos.x + Math.cos(angle) * radius,
-        y: pos.y + Math.sin(angle) * radius,
-      });
+
+      const isOutlier = (n as { labels?: string[] }).labels?.includes('LearningComponent');
+      if (isOutlier) {
+        // Direction away from the graph centroid through the parent.
+        const dx = pos.x - centroidX;
+        const dy = pos.y - centroidY;
+        const mag = Math.max(1, Math.hypot(dx, dy));
+        const outX = dx / mag;
+        const outY = dy / mag;
+        const radius = 220 + Math.random() * 80;
+        // Fan LC siblings perpendicular to the outward ray.
+        const spread = ((idx - (siblings - 1) / 2) / Math.max(1, siblings)) * 80;
+        seedUpdates.push({
+          id,
+          x: pos.x + outX * radius + -outY * spread,
+          y: pos.y + outY * radius + outX * spread,
+        });
+      } else {
+        const radius = 18 + Math.random() * 12;
+        const angle = (idx / siblings) * Math.PI * 2 + Math.random() * 0.3;
+        seedUpdates.push({
+          id,
+          x: pos.x + Math.cos(angle) * radius,
+          y: pos.y + Math.sin(angle) * radius,
+        });
+      }
     }
     if (seedUpdates.length) nodesDs.update(seedUpdates);
 
@@ -426,27 +441,33 @@ export default function GraphViewer({
         enabled: true,
         solver: 'forceAtlas2Based',
         forceAtlas2Based: {
-          gravitationalConstant: isFirstLoad ? -40 : -20,
+          gravitationalConstant: isFirstLoad ? -40 : -30,
           centralGravity: 0.003,
           springLength: 110,
-          springConstant: isFirstLoad ? 0.08 : 0.04,
-          avoidOverlap: 0.4,
-          damping: isFirstLoad ? 0.85 : 0.95,
+          springConstant: isFirstLoad ? 0.08 : 0.05,
+          avoidOverlap: 0.6,
+          // Lower damping on incremental adds so the bloom is actually visible.
+          // Still high enough that motion dies quickly (well under a second).
+          damping: isFirstLoad ? 0.85 : 0.72,
         },
         stabilization: {
           enabled: true,
-          iterations: isFirstLoad ? 220 : 25,
-          updateInterval: 10,
+          iterations: isFirstLoad ? 220 : 45,
+          updateInterval: 8,
           fit: isFirstLoad,
         },
-        minVelocity: 4,
-        timestep: 0.4,
+        minVelocity: 0.5,
+        timestep: 0.45,
       },
     });
-    // Belt-and-braces: force physics off after a bounded wall-clock time in
-    // case `stabilizationIterationsDone` doesn't fire for some reason.
+    // setOptions alone does NOT kick off a stabilization pass. stabilize() does:
+    // it runs the configured iterations and emits stabilizationIterationsDone
+    // at the end, which is what drives the visible animation.
+    net.stabilize();
     const disable = () => net.setOptions({ physics: { enabled: false } });
     net.once('stabilizationIterationsDone', disable);
+    // Belt-and-braces: force physics off after a bounded wall-clock time in
+    // case `stabilizationIterationsDone` doesn't fire.
     setTimeout(disable, 1500);
   }, [visNodes, visEdges]);
 

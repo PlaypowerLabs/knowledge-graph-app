@@ -22,18 +22,24 @@ type SubgraphResponse = {
   stats: { nodeCount: number; edgeCount: number; durationMs: number };
 };
 
-// Which relationship types define containment / tree edges. Expanding a node
-// reveals its children along these edges only; cross-edges (supports,
-// hasStandardAlignment, etc.) render automatically when both endpoints exist.
+// Edges whose source -> target is a containment relationship (parent contains
+// child). Expanding a node reveals children along these.
 const CONTAINMENT_EDGES = new Set(['hasChild', 'hasPart']);
+// Edges where the CHILD points to the parent semantically. `supports` runs
+// LearningComponent -> Standard, but from a UI containment perspective the
+// Standard is the parent that should reveal its supporting LCs on expand.
+const REVERSE_CONTAINMENT_EDGES = new Set(['supports']);
 
 function buildChildrenMap(edges: GraphEdge[]): Map<string, string[]> {
   const m = new Map<string, string[]>();
+  const push = (k: string, v: string) => {
+    const arr = m.get(k);
+    if (arr) arr.push(v);
+    else m.set(k, [v]);
+  };
   for (const e of edges) {
-    if (!CONTAINMENT_EDGES.has(e.label)) continue;
-    const arr = m.get(e.source);
-    if (arr) arr.push(e.target);
-    else m.set(e.source, [e.target]);
+    if (CONTAINMENT_EDGES.has(e.label)) push(e.source, e.target);
+    else if (REVERSE_CONTAINMENT_EDGES.has(e.label)) push(e.target, e.source);
   }
   return m;
 }
@@ -41,20 +47,41 @@ function buildChildrenMap(edges: GraphEdge[]): Map<string, string[]> {
 export default function Page() {
   const [frameworks, setFrameworks] = useState<FrameworkOption[]>([]);
   const [frameworkId, setFrameworkId] = useState<string>('');
-  const [includeCurriculum, setIncludeCurriculum] = useState(false);
   const [graph, setGraph] = useState<SubgraphResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<GraphNode | null>(null);
-  const [visibleIds, setVisibleIds] = useState<Set<string>>(new Set());
+  // Track which nodes the user has explicitly expanded. Visibility is derived
+  // (BFS from the framework root through expanded parents), which means a
+  // child is visible iff at least one of its expanded parents is visible —
+  // the reference-counting behavior for shared children (e.g. a
+  // LearningComponent that supports multiple Standards).
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
   const childrenMap = useMemo(
     () => (graph ? buildChildrenMap(graph.edges) : new Map<string, string[]>()),
     [graph],
   );
 
+  const visibleIds = useMemo(() => {
+    const s = new Set<string>();
+    if (!frameworkId) return s;
+    s.add(frameworkId);
+    const queue: string[] = [frameworkId];
+    while (queue.length) {
+      const cur = queue.shift()!;
+      if (!expandedIds.has(cur)) continue;
+      for (const c of childrenMap.get(cur) || []) {
+        if (s.has(c)) continue;
+        s.add(c);
+        queue.push(c);
+      }
+    }
+    return s;
+  }, [frameworkId, expandedIds, childrenMap]);
+
   useEffect(() => {
-    fetch('/api/frameworks')
+    fetch('/subgraphs/frameworks.json')
       .then((r) => r.json())
       .then((data: { frameworks: FrameworkOption[] }) => {
         setFrameworks(data.frameworks);
@@ -72,69 +99,33 @@ export default function Page() {
     const ctrl = new AbortController();
     setLoading(true);
     setError(null);
-    const params = new URLSearchParams({
-      framework: frameworkId,
-      curriculum: String(includeCurriculum),
-    });
-    fetch(`/api/subgraph?${params}`, { signal: ctrl.signal })
+    fetch(`/subgraphs/${encodeURIComponent(frameworkId)}_cur.json`, {
+      signal: ctrl.signal,
+    })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((data: SubgraphResponse) => {
         setGraph(data);
         setSelected(null);
-        // Default view: framework + its direct children so the user sees something
-        // immediately but doesn't drown in all 1,500 nodes.
-        const m = buildChildrenMap(data.edges);
-        const initial = new Set<string>([frameworkId]);
-        for (const c of m.get(frameworkId) || []) initial.add(c);
-        setVisibleIds(initial);
+        // Default view: framework expanded (so its direct children show) but
+        // nothing deeper, so the user sees something immediately without
+        // drowning in all 1,500 nodes.
+        setExpandedIds(new Set([frameworkId]));
       })
       .catch((e) => {
         if ((e as Error).name !== 'AbortError') setError(String(e));
       })
       .finally(() => setLoading(false));
     return () => ctrl.abort();
-  }, [frameworkId, includeCurriculum]);
+  }, [frameworkId]);
 
   const toggleChildren = useCallback(
     (nodeId: string) => {
-      setVisibleIds((prev) => {
+      setExpandedIds((prev) => {
         const children = childrenMap.get(nodeId) || [];
         if (!children.length) return prev;
         const next = new Set(prev);
-        const anyVisible = children.some((c) => next.has(c));
-        if (anyVisible) {
-          // Collapse: remove the entire subtree (children, grandchildren, ...).
-          const stack = [...children];
-          while (stack.length) {
-            const cur = stack.pop()!;
-            if (!next.has(cur)) continue;
-            next.delete(cur);
-            for (const c of childrenMap.get(cur) || []) stack.push(c);
-          }
-        } else {
-          for (const c of children) next.add(c);
-        }
-        return next;
-      });
-    },
-    [childrenMap],
-  );
-
-  const expandSubtree = useCallback(
-    (nodeId: string) => {
-      setVisibleIds((prev) => {
-        const next = new Set(prev);
-        next.add(nodeId);
-        const queue = [nodeId];
-        while (queue.length) {
-          const cur = queue.shift()!;
-          for (const c of childrenMap.get(cur) || []) {
-            if (!next.has(c)) {
-              next.add(c);
-              queue.push(c);
-            }
-          }
-        }
+        if (next.has(nodeId)) next.delete(nodeId);
+        else next.add(nodeId);
         return next;
       });
     },
@@ -143,12 +134,17 @@ export default function Page() {
 
   const expandAll = useCallback(() => {
     if (!graph) return;
-    setVisibleIds(new Set(graph.nodes.map((n) => n.id)));
-  }, [graph]);
+    // Expand every node that has any containment children; `visibleIds` then
+    // reaches the whole graph via BFS.
+    const all = new Set<string>();
+    for (const [id] of childrenMap) all.add(id);
+    setExpandedIds(all);
+  }, [graph, childrenMap]);
 
   const collapseAll = useCallback(() => {
     if (!frameworkId) return;
-    setVisibleIds(new Set([frameworkId]));
+    // Leave no nodes expanded: only the framework root remains visible.
+    setExpandedIds(new Set());
   }, [frameworkId]);
 
   const displayedNodes = useMemo(() => {
@@ -194,15 +190,6 @@ export default function Page() {
           </select>
         </label>
 
-        <label>
-          <input
-            type="checkbox"
-            checked={includeCurriculum}
-            onChange={(e) => setIncludeCurriculum(e.target.checked)}
-          />
-          Include curriculum
-        </label>
-
         <span className="divider" />
 
         <button onClick={expandAll} disabled={!graph} title="Show every node">
@@ -244,7 +231,6 @@ export default function Page() {
           loading={loading}
           onSelectNode={setSelected}
           onToggleChildren={toggleChildren}
-          onExpandSubtree={expandSubtree}
         />
         <Legend />
         <NodeDetail node={selected} onClose={() => setSelected(null)} />
