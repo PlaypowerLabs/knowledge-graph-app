@@ -214,6 +214,12 @@ export default function Page() {
             '…'
           )}
           <Link
+            href="/coherence"
+            style={{ marginLeft: 14, color: '#4a90e2', textDecoration: 'none' }}
+          >
+            Coherence Map →
+          </Link>
+          <Link
             href="/documents"
             style={{ marginLeft: 14, color: '#4a90e2', textDecoration: 'none' }}
           >
