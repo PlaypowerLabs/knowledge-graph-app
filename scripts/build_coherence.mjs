@@ -10,12 +10,16 @@
 // Inputs:  data/math/{nodes,relationships}.jsonl
 // Outputs: app/public/coherence/graph.json
 //          app/public/coherence/index.json
+//          app/public/coherence/ixl-links.json
+//          app/public/coherence/adaptive-diagnostic.json
 //          app/public/coherence/focus/<caseIdentifierUUID>.json  (one per edge-bearing standard)
 
 import fs from 'node:fs';
 import readline from 'node:readline';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { buildCoherenceAdaptive } from './lib/build_coherence_adaptive.mjs';
+import { buildCoherenceIxl } from './lib/build_coherence_ixl.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..');
@@ -104,35 +108,57 @@ function gradeRank(g) {
 
 const t0 = Date.now();
 
-console.error('[1/4] Loading Multi-State CCSS-M nodes...');
+console.error('[1/6] Loading Multi-State CCSS-M nodes...');
 const nodes = new Map(); // identifier -> compact node record
+const learningComponents = new Map(); // identifier -> compact LC record
 for await (const line of lines(path.join(SRC, 'nodes.jsonl'))) {
   const rec = JSON.parse(line);
-  if (!rec.labels?.includes('StandardsFrameworkItem')) continue;
   const p = rec.properties || {};
-  if (p.jurisdiction !== 'Multi-State') continue;
-  if (p.academicSubject !== 'Mathematics') continue;
-  const parsed = parseCode(p.statementCode);
-  nodes.set(rec.identifier, {
-    id: rec.identifier,
-    caseIdentifierUUID: p.caseIdentifierUUID || null,
-    code: p.statementCode || null,
-    description: p.description || null,
-    statementType: p.statementType || null,
-    gradeLevels: parseGradeLevel(p.gradeLevel),
-    grade: parsed.grade,
-    domain: parsed.domain,
-    cluster: parsed.cluster,
-    level: parsed.level,
-  });
+  if (rec.labels?.includes('StandardsFrameworkItem')) {
+    if (p.jurisdiction !== 'Multi-State') continue;
+    if (p.academicSubject !== 'Mathematics') continue;
+    const parsed = parseCode(p.statementCode);
+    nodes.set(rec.identifier, {
+      id: rec.identifier,
+      caseIdentifierUUID: p.caseIdentifierUUID || null,
+      code: p.statementCode || null,
+      description: p.description || null,
+      statementType: p.statementType || null,
+      gradeLevels: parseGradeLevel(p.gradeLevel),
+      grade: parsed.grade,
+      domain: parsed.domain,
+      cluster: parsed.cluster,
+      level: parsed.level,
+    });
+    continue;
+  }
+
+  if (rec.labels?.includes('LearningComponent')) {
+    if (p.academicSubject !== 'Mathematics') continue;
+    learningComponents.set(rec.identifier, {
+      id: rec.identifier,
+      description: p.description || null,
+      author: p.author || null,
+      provider: p.provider || null,
+    });
+  }
 }
 console.error(`  ${nodes.size} Multi-State CCSS-M SFI nodes`);
+console.error(`  ${learningComponents.size} math learning components`);
 
-console.error('[2/4] Loading buildsTowards (+ relatesTo, mutuallyExclusiveWith) edges...');
+console.error('[2/6] Loading buildsTowards (+ relatesTo, mutuallyExclusiveWith) edges...');
 const edges = []; // { id, label, source, target }
 const edgeCounts = {};
+const supportsRev = new Map(); // standard id -> [lc ids]
 for await (const line of lines(path.join(SRC, 'relationships.jsonl'))) {
   const r = JSON.parse(line);
+  if (
+    r.label === 'supports' &&
+    nodes.has(r.target_identifier) &&
+    learningComponents.has(r.source_identifier)
+  ) {
+    pushMulti(supportsRev, r.target_identifier, r.source_identifier);
+  }
   if (!KEEP_EDGE_LABELS.has(r.label)) continue;
   if (!nodes.has(r.source_identifier) || !nodes.has(r.target_identifier)) continue;
   edges.push({
@@ -169,7 +195,7 @@ function closure(adj, start) {
   return seen;
 }
 
-console.error('[3/4] Writing graph.json and index.json...');
+console.error('[3/6] Writing graph.json and index.json...');
 fs.mkdirSync(FOCUS_DIR, { recursive: true });
 
 // Sort nodes for stable output: grade, then cluster, then code.
@@ -227,7 +253,20 @@ const index = {
 };
 fs.writeFileSync(path.join(OUT, 'index.json'), JSON.stringify(index));
 
-console.error('[4/4] Writing per-standard focus ego networks...');
+console.error('[4/6] Building CCSS → IXL standard links...');
+await buildCoherenceIxl({
+  outFile: path.join(OUT, 'ixl-links.json'),
+  validStandardCodes: new Set(sortedNodes.map((n) => n.code).filter(Boolean)),
+});
+
+console.error('[5/6] Building adaptive diagnostic plans...');
+await buildCoherenceAdaptive({
+  graphFile: path.join(OUT, 'graph.json'),
+  ixlFile: path.join(OUT, 'ixl-links.json'),
+  outFile: path.join(OUT, 'adaptive-diagnostic.json'),
+});
+
+console.error('[6/6] Writing per-standard focus ego networks...');
 // Emit one focus file per node that has at least one buildsTowards edge
 // (in or out). Skip pure structural nodes (Domain/Cluster headers with no edges).
 let focusCount = 0;
@@ -255,15 +294,21 @@ for (const n of sortedNodes) {
   const focusEdges = edges.filter(
     (e) => e.label === 'buildsTowards' && scope.has(e.source) && scope.has(e.target),
   );
+  const focusLearningComponents = [...new Set(supportsRev.get(n.id) || [])]
+    .map((id) => learningComponents.get(id))
+    .filter(Boolean)
+    .sort((a, b) => (a.description || '').localeCompare(b.description || ''));
 
   const payload = {
     focus: n,
     ancestors: ancestors.sort((a, b) => gradeRank(a.grade) - gradeRank(b.grade)),
     descendants: descendants.sort((a, b) => gradeRank(a.grade) - gradeRank(b.grade)),
+    learningComponents: focusLearningComponents,
     edges: focusEdges,
     stats: {
       ancestorCount: ancestors.length,
       descendantCount: descendants.length,
+      learningComponentCount: focusLearningComponents.length,
       edgeCount: focusEdges.length,
     },
   };

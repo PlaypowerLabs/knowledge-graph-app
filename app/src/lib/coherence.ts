@@ -35,14 +35,23 @@ export type CoherenceGraph = {
   };
 };
 
+export type CoherenceLearningComponent = {
+  id: string;
+  description: string | null;
+  author: string | null;
+  provider: string | null;
+};
+
 export type CoherenceFocus = {
   focus: CoherenceNode;
   ancestors: CoherenceNode[];
   descendants: CoherenceNode[];
+  learningComponents: CoherenceLearningComponent[];
   edges: CoherenceEdge[];
   stats: {
     ancestorCount: number;
     descendantCount: number;
+    learningComponentCount: number;
     edgeCount: number;
   };
 };

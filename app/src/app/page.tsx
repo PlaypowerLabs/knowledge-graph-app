@@ -220,6 +220,12 @@ export default function Page() {
             Coherence Map →
           </Link>
           <Link
+            href="/diagnostic"
+            style={{ marginLeft: 14, color: '#4a90e2', textDecoration: 'none' }}
+          >
+            Diagnostic Simulator →
+          </Link>
+          <Link
             href="/documents"
             style={{ marginLeft: 14, color: '#4a90e2', textDecoration: 'none' }}
           >

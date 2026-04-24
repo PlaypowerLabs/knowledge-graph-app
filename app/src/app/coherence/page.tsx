@@ -13,7 +13,10 @@ import {
   domainName,
   plainifyDescription,
 } from '@/lib/coherence';
+import type { CoherenceIxlIndex } from '@/lib/coherenceIxl';
 import CoherenceGrid from '@/components/CoherenceGrid';
+import CoherenceLearningComponentsSection from '@/components/CoherenceLearningComponentsSection';
+import CoherenceIxlSection from '@/components/CoherenceIxlSection';
 
 // Network renderer uses vis-network, which pokes at `window`; load client-only.
 const CoherenceFocus = dynamic(() => import('@/components/CoherenceFocus'), { ssr: false });
@@ -21,7 +24,9 @@ const CoherenceFocus = dynamic(() => import('@/components/CoherenceFocus'), { ss
 export default function CoherencePage() {
   const [graph, setGraph] = useState<CoherenceGraph | null>(null);
   const [index, setIndex] = useState<CoherenceIndex | null>(null);
+  const [ixlIndex, setIxlIndex] = useState<CoherenceIxlIndex | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [ixlError, setIxlError] = useState<string | null>(null);
 
   const [focusCode, setFocusCode] = useState<string | null>(null);
   const [focusData, setFocusData] = useState<FocusData | null>(null);
@@ -39,6 +44,11 @@ export default function CoherencePage() {
         setIndex(i as CoherenceIndex);
       })
       .catch((e) => setError(String(e)));
+
+    fetch('/coherence/ixl-links.json')
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((data) => setIxlIndex(data as CoherenceIxlIndex))
+      .catch((e) => setIxlError(`IXL links unavailable: ${String(e)}`));
 
     const params = new URLSearchParams(window.location.search);
     const initial = params.get('focus');
@@ -119,6 +129,12 @@ export default function CoherencePage() {
   }, [focusData]);
 
   const focusNode: CoherenceNode | null = focusData?.focus ?? null;
+  const focusNodeFromGraph = useMemo(() => {
+    if (!graph || !focusCode) return null;
+    return graph.nodes.find((node) => node.code === focusCode) ?? null;
+  }, [graph, focusCode]);
+  const selectedFocusNode = focusNode ?? focusNodeFromGraph;
+  const ixlStandard = focusCode ? ixlIndex?.by_standard_code[focusCode] ?? null : null;
 
   return (
     <div className="coh-app">
@@ -153,6 +169,12 @@ export default function CoherencePage() {
           ) : (
             'Loading…'
           )}
+          <Link
+            href="/diagnostic"
+            style={{ marginLeft: 14, color: '#4a90e2', textDecoration: 'none' }}
+          >
+            Diagnostic Simulator →
+          </Link>
           <Link href="/" style={{ marginLeft: 14, color: '#4a90e2', textDecoration: 'none' }}>
             ← KG Viewer
           </Link>
@@ -178,9 +200,9 @@ export default function CoherencePage() {
             <div className="coh-drawer-head">
               <div>
                 <div className="coh-drawer-code">{focusCode}</div>
-                {focusNode?.grade && (
+                {selectedFocusNode?.grade && (
                   <div className="coh-drawer-sub">
-                    Grade {focusNode.grade} · {domainName(focusNode.domain)}
+                    Grade {selectedFocusNode.grade} · {domainName(selectedFocusNode.domain)}
                   </div>
                 )}
               </div>
@@ -191,9 +213,11 @@ export default function CoherencePage() {
 
             {focusLoading && <div className="coh-loading">Loading ego network…</div>}
 
-            {focusNode?.description && (
-              <p className="coh-drawer-desc">{plainifyDescription(focusNode.description)}</p>
+            {selectedFocusNode?.description && (
+              <p className="coh-drawer-desc">{plainifyDescription(selectedFocusNode.description)}</p>
             )}
+
+            {focusData && <CoherenceLearningComponentsSection items={focusData.learningComponents} />}
 
             {focusData && (
               <>
@@ -219,6 +243,13 @@ export default function CoherencePage() {
                 />
               </>
             )}
+
+            <CoherenceIxlSection
+              standardCode={focusCode}
+              data={ixlStandard}
+              loading={!ixlIndex && !ixlError}
+              error={ixlError}
+            />
           </aside>
         )}
       </div>

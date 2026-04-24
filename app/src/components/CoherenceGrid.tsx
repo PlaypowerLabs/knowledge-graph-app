@@ -16,12 +16,23 @@ type Props = {
   // UUIDs to softly highlight (lineage of the focused standard).
   highlightUuids: Set<string>;
   onSelect: (code: string) => void;
+  statusByCode?: Record<string, 'mastered' | 'unmastered' | 'mixed' | 'unknown'>;
+  pathCodes?: Set<string>;
+  changedCodes?: Set<string>;
 };
 
 // Canonical SAP-style grid: grades as rows (K → HS), domains as columns.
 // Each cell shows the clusters for that (grade, domain) and the standards
 // in each cluster as clickable chips.
-export default function CoherenceGrid({ graph, focusCode, highlightUuids, onSelect }: Props) {
+export default function CoherenceGrid({
+  graph,
+  focusCode,
+  highlightUuids,
+  onSelect,
+  statusByCode,
+  pathCodes,
+  changedCodes,
+}: Props) {
   const buckets = useMemo(() => bucketByGradeCluster(graph.nodes), [graph]);
 
   // Order domains as they appear in the data, with K-8 core domains first
@@ -79,6 +90,9 @@ export default function CoherenceGrid({ graph, focusCode, highlightUuids, onSele
                       byCluster={byCluster}
                       focusCode={focusCode}
                       highlightUuids={highlightUuids}
+                      statusByCode={statusByCode}
+                      pathCodes={pathCodes}
+                      changedCodes={changedCodes}
                       onSelect={onSelect}
                     />
                   </td>
@@ -98,6 +112,9 @@ function ClusterColumn({
   byCluster,
   focusCode,
   highlightUuids,
+  statusByCode,
+  pathCodes,
+  changedCodes,
   onSelect,
 }: {
   grade: string;
@@ -105,6 +122,9 @@ function ClusterColumn({
   byCluster: Map<string, CoherenceNode[]>;
   focusCode: string | null;
   highlightUuids: Set<string>;
+  statusByCode?: Record<string, 'mastered' | 'unmastered' | 'mixed' | 'unknown'>;
+  pathCodes?: Set<string>;
+  changedCodes?: Set<string>;
   onSelect: (code: string) => void;
 }) {
   // Find the clusters that fall under this (grade, domain) pair. A cluster
@@ -131,10 +151,16 @@ function ClusterColumn({
               const isLineage = s.caseIdentifierUUID
                 ? highlightUuids.has(s.caseIdentifierUUID)
                 : false;
+              const status = statusByCode?.[code] ?? null;
+              const isPath = pathCodes?.has(code) ?? false;
+              const isChanged = changedCodes?.has(code) ?? false;
               const cls = [
                 'coh-chip',
                 isFocus ? 'coh-chip-focus' : '',
                 isLineage && !isFocus ? 'coh-chip-lineage' : '',
+                status ? `coh-chip-status-${status}` : '',
+                isPath && !isFocus ? 'coh-chip-path' : '',
+                isChanged ? 'coh-chip-changed' : '',
               ]
                 .filter(Boolean)
                 .join(' ');
