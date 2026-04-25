@@ -287,6 +287,7 @@ button, select, input { font: inherit; }
   transition: background 0.08s ease, color 0.08s ease;
 }
 .coh-chip:hover { background: #eef2ff; }
+a.coh-chip { text-decoration: none; color: #1f2937; display: inline-flex; align-items: center; }
 .coh-chip-lineage {
   background: #fff7e6;
   border-color: #f1c40f;
@@ -571,6 +572,7 @@ button, select, input { font: inherit; }
   text-align: left;
 }
 .curr-chip:hover { background: #eef2ff; }
+a.curr-chip { text-decoration: none; color: #1f2937; display: inline-flex; align-items: center; }
 .curr-chip-course {
   display: inline-block;
   background: #e5e7eb;

@@ -12,6 +12,7 @@ import {
   bandColor,
   prettyCourse,
 } from '@/lib/curriculum';
+import type { Alignments, AlignedStandard } from '@/lib/alignments';
 import CurriculumGrid from '@/components/CurriculumGrid';
 
 const CurriculumFocus = dynamic(() => import('@/components/CurriculumFocus'), { ssr: false });
@@ -19,6 +20,7 @@ const CurriculumFocus = dynamic(() => import('@/components/CurriculumFocus'), { 
 export default function CurriculumPage() {
   const [graph, setGraph] = useState<CurriculumGraph | null>(null);
   const [index, setIndex] = useState<CurriculumIndex | null>(null);
+  const [alignments, setAlignments] = useState<Alignments | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [focusId, setFocusId] = useState<string | null>(null);
@@ -30,10 +32,14 @@ export default function CurriculumPage() {
     Promise.all([
       fetch('/curriculum/graph.json').then((r) => r.json()),
       fetch('/curriculum/index.json').then((r) => r.json()),
+      fetch('/alignments.json')
+        .then((r) => (r.ok ? r.json() : null))
+        .catch(() => null),
     ])
-      .then(([g, i]) => {
+      .then(([g, i, a]) => {
         setGraph(g as CurriculumGraph);
         setIndex(i as CurriculumIndex);
+        if (a) setAlignments(a as Alignments);
       })
       .catch((e) => setError(String(e)));
 
@@ -201,6 +207,10 @@ export default function CurriculumPage() {
                   direction="forward"
                   onSelect={handleSelect}
                 />
+
+                <AlignedStandards
+                  standards={alignments?.unitToStandards[focusData.focus.id] ?? []}
+                />
               </>
             )}
           </aside>
@@ -269,6 +279,34 @@ function LineageList({
             <span className="curr-chip-course">{prettyCourse(n.courseCode)}</span>
             {n.name}
           </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Cross-link into /coherence. CCSS-M standards this unit covers, each chip
+// jumps to the corresponding standard's coherence focus view.
+function AlignedStandards({ standards }: { standards: AlignedStandard[] }) {
+  if (!standards.length) return null;
+  return (
+    <div className="curr-lineage">
+      <h4>
+        Aligned CCSS-M standards{' '}
+        <span className="curr-lineage-count">{standards.length}</span>
+      </h4>
+      <div className="curr-chips">
+        {standards.map((s) => (
+          <Link
+            key={s.id}
+            href={`/coherence?focus=${encodeURIComponent(s.code ?? '')}`}
+            className="curr-chip"
+            title={s.code ?? ''}
+            style={{ borderColor: '#4a90e2', maxWidth: 140 }}
+          >
+            <span className="curr-chip-course">CCSS-M</span>
+            {s.code}
+          </Link>
         ))}
       </div>
     </div>

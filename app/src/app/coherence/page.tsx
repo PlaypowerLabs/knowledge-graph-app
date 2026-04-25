@@ -13,6 +13,7 @@ import {
   domainName,
   plainifyDescription,
 } from '@/lib/coherence';
+import type { Alignments, AlignedUnit } from '@/lib/alignments';
 import CoherenceGrid from '@/components/CoherenceGrid';
 
 // Network renderer uses vis-network, which pokes at `window`; load client-only.
@@ -21,6 +22,7 @@ const CoherenceFocus = dynamic(() => import('@/components/CoherenceFocus'), { ss
 export default function CoherencePage() {
   const [graph, setGraph] = useState<CoherenceGraph | null>(null);
   const [index, setIndex] = useState<CoherenceIndex | null>(null);
+  const [alignments, setAlignments] = useState<Alignments | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const [focusCode, setFocusCode] = useState<string | null>(null);
@@ -28,15 +30,20 @@ export default function CoherencePage() {
   const [focusLoading, setFocusLoading] = useState(false);
   const [query, setQuery] = useState('');
 
-  // Initial load: graph + index + ?focus= param.
+  // Initial load: graph + index + alignments + ?focus= param.
   useEffect(() => {
     Promise.all([
       fetch('/coherence/graph.json').then((r) => r.json()),
       fetch('/coherence/index.json').then((r) => r.json()),
+      // Alignments are a nice-to-have for the drawer; ignore failure silently.
+      fetch('/alignments.json')
+        .then((r) => (r.ok ? r.json() : null))
+        .catch(() => null),
     ])
-      .then(([g, i]) => {
+      .then(([g, i, a]) => {
         setGraph(g as CoherenceGraph);
         setIndex(i as CoherenceIndex);
+        if (a) setAlignments(a as Alignments);
       })
       .catch((e) => setError(String(e)));
 
@@ -153,6 +160,12 @@ export default function CoherencePage() {
           ) : (
             'Loading…'
           )}
+          <Link
+            href="/curriculum"
+            style={{ marginLeft: 14, color: '#4a90e2', textDecoration: 'none' }}
+          >
+            Curriculum →
+          </Link>
           <Link href="/" style={{ marginLeft: 14, color: '#4a90e2', textDecoration: 'none' }}>
             ← KG Viewer
           </Link>
@@ -216,6 +229,10 @@ export default function CoherencePage() {
                   edges={focusData.edges}
                   direction="forward"
                   onSelect={handleSelect}
+                />
+
+                <TaughtByUnits
+                  units={alignments?.standardToUnits[focusData.focus.id] ?? []}
                 />
               </>
             )}
@@ -292,6 +309,48 @@ function LineageList({
             {n.code}
           </button>
         ))}
+      </div>
+    </div>
+  );
+}
+
+// Cross-link into /curriculum. IM units that cover this focused standard, grouped
+// by course so a teacher can see "which of my units teach this."
+function TaughtByUnits({ units }: { units: AlignedUnit[] }) {
+  const [showAll, setShowAll] = useState(false);
+  if (!units.length) return null;
+
+  const INITIAL = 8;
+  const visible = showAll ? units : units.slice(0, INITIAL);
+  const hidden = units.length - visible.length;
+
+  return (
+    <div className="coh-lineage">
+      <h4>
+        Taught by IM units <span className="coh-lineage-count">{units.length}</span>
+      </h4>
+      <div className="coh-chips">
+        {visible.map((u) => (
+          <Link
+            key={u.id}
+            href={`/curriculum?focus=${encodeURIComponent(u.shortId)}`}
+            className="coh-chip"
+            title={u.name ?? ''}
+          >
+            <span className="coh-chip-grade">{u.courseCode?.replace(/^im360:/, '') ?? '—'}</span>
+            {u.name}
+          </Link>
+        ))}
+        {hidden > 0 && (
+          <button
+            type="button"
+            className="coh-chip"
+            onClick={() => setShowAll(true)}
+            style={{ color: '#4a90e2', borderStyle: 'dashed' }}
+          >
+            +{hidden} more
+          </button>
+        )}
       </div>
     </div>
   );
