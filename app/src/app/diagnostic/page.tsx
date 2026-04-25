@@ -4,11 +4,13 @@ import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import type { CoherenceGraph } from '@/lib/coherence';
 import type { AdaptiveDiagnosticIndex } from '@/lib/coherenceAdaptive';
+import type { CoherenceIxlIndex } from '@/lib/coherenceIxl';
 import DiagnosticSimulator from '@/components/DiagnosticSimulator';
 
 export default function DiagnosticPage() {
   const [graph, setGraph] = useState<CoherenceGraph | null>(null);
   const [adaptive, setAdaptive] = useState<AdaptiveDiagnosticIndex | null>(null);
+  const [ixl, setIxl] = useState<CoherenceIxlIndex | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [initialGrade, setInitialGrade] = useState<string | null>(null);
 
@@ -20,10 +22,14 @@ export default function DiagnosticPage() {
       fetch('/coherence/adaptive-diagnostic.json').then((r) =>
         r.ok ? r.json() : Promise.reject(new Error(`adaptive ${r.status}`)),
       ),
+      fetch('/coherence/ixl-links.json').then((r) =>
+        r.ok ? r.json() : Promise.reject(new Error(`ixl ${r.status}`)),
+      ),
     ])
-      .then(([graphData, adaptiveData]) => {
+      .then(([graphData, adaptiveData, ixlData]) => {
         setGraph(graphData as CoherenceGraph);
         setAdaptive(adaptiveData as AdaptiveDiagnosticIndex);
+        setIxl(ixlData as CoherenceIxlIndex);
       })
       .catch((e) => setError(String(e)));
 
@@ -51,12 +57,12 @@ export default function DiagnosticPage() {
     );
   }
 
-  if (!graph || !adaptive) {
+  if (!graph || !adaptive || !ixl) {
     return (
       <div className="coh-app">
         <div className="toolbar">
           <span className="title">Graph-Adaptive Diagnostic Simulator · CCSS-M</span>
-          <div className="stats">Loading graph and adaptive plans…</div>
+          <div className="stats">Loading graph, adaptive plans, and IXL question links…</div>
         </div>
       </div>
     );
@@ -64,7 +70,12 @@ export default function DiagnosticPage() {
 
   return (
     <div className="coh-app">
-      <DiagnosticSimulator graph={graph} adaptive={adaptive} initialGrade={initialGrade} />
+      <DiagnosticSimulator
+        graph={graph}
+        adaptive={adaptive}
+        ixl={ixl}
+        initialGrade={initialGrade}
+      />
     </div>
   );
 }

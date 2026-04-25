@@ -1,31 +1,95 @@
 'use client';
 
-import { startTransition, useCallback, useEffect, useMemo, useState } from 'react';
+import { startTransition, useCallback, useMemo, useState } from 'react';
 import Link from 'next/link';
-import { RotateCcw, Undo2 } from 'lucide-react';
-import CoherenceGrid from '@/components/CoherenceGrid';
+import { CircleHelp, ExternalLink, RotateCcw, Undo2 } from 'lucide-react';
+import DiagnosticGraphView from '@/components/DiagnosticGraphView';
+import DockableDiagnosticShell, {
+  type DiagnosticWorkbenchLayout,
+  type DiagnosticWorkbenchTab,
+} from '@/components/DockableDiagnosticShell';
+import DiagnosticQuestionSurface from '@/components/DiagnosticQuestionSurface';
 import {
   type CoherenceGraph,
+  domainColor,
   domainName,
   plainifyDescription,
 } from '@/lib/coherence';
 import type { AdaptiveDiagnosticIndex } from '@/lib/coherenceAdaptive';
 import { formatAdaptivePercent } from '@/lib/coherenceAdaptive';
 import {
+  buildIxlViewerUrl,
+  buildIxlQuestionUrl,
+  findIxlStandard,
+  findIxlSkill,
+  formatIxlLevelMeta,
+  type CoherenceIxlIndex,
+  type CoherenceIxlStandard,
+} from '@/lib/coherenceIxl';
+import { selectCurrentDiagnosticLevel, sortIxlLevels } from '@/lib/diagnosticQuestionSelection';
+import {
   createDiagnosticModel,
+  type DiagnosticBranchPreview,
   diagnosticOutcomeOptions,
   type DiagnosticCandidateView,
   type DiagnosticOutcome,
   simulateDiagnosticSession,
-} from '@/lib/diagnosticSimulator';
+} from '@/lib/diagnosticEngine';
 
 type Props = {
   graph: CoherenceGraph;
   adaptive: AdaptiveDiagnosticIndex;
+  ixl: CoherenceIxlIndex;
   initialGrade?: string | null;
 };
 
-export default function DiagnosticSimulator({ graph, adaptive, initialGrade }: Props) {
+type DomainMasterySummary = {
+  domain: string;
+  label: string;
+  standardCount: number;
+  mastery: number;
+  confidence: number;
+  evidenceCount: number;
+  masteredCount: number;
+  weakCount: number;
+  unknownCount: number;
+  pressure: number;
+};
+
+const DIAGNOSTIC_WORKBENCH_DEFAULT: DiagnosticWorkbenchLayout = {
+  root: {
+    type: 'split',
+    id: 'root',
+    direction: 'row',
+    ratio: 0.62,
+    first: {
+      type: 'pane',
+      id: 'pane-question',
+      tabs: ['question'],
+      activeTabId: 'question',
+    },
+    second: {
+      type: 'split',
+      id: 'root-right',
+      direction: 'column',
+      ratio: 0.72,
+      first: {
+        type: 'pane',
+        id: 'pane-work',
+        tabs: ['current', 'why', 'graph'],
+        activeTabId: 'current',
+      },
+      second: {
+        type: 'pane',
+        id: 'pane-history',
+        tabs: ['history'],
+        activeTabId: 'history',
+      },
+    },
+  },
+};
+
+export default function DiagnosticSimulator({ graph, adaptive, ixl, initialGrade }: Props) {
   const model = useMemo(() => createDiagnosticModel(graph, adaptive), [graph, adaptive]);
   const defaultGrade = useMemo(() => {
     if (initialGrade && model.grades.includes(initialGrade)) return initialGrade;
@@ -37,36 +101,19 @@ export default function DiagnosticSimulator({ graph, adaptive, initialGrade }: P
   const [events, setEvents] = useState<DiagnosticOutcome[]>([]);
   const [inspectedCode, setInspectedCode] = useState<string | null>(null);
 
-  useEffect(() => {
-    setDraftGrade(defaultGrade);
-    setSessionGrade(defaultGrade);
-    setEvents([]);
-  }, [defaultGrade]);
-
   const session = useMemo(() => {
     if (!sessionGrade) return null;
     return simulateDiagnosticSession(model, sessionGrade, events);
   }, [events, model, sessionGrade]);
 
-  useEffect(() => {
-    if (!session?.current_target_standard_code) return;
-    if (!inspectedCode) setInspectedCode(session.current_target_standard_code);
-  }, [inspectedCode, session?.current_target_standard_code]);
-
   const inspectedNode = useMemo(() => {
     const code = inspectedCode || session?.current_target_standard_code;
     return code ? model.nodesByCode.get(code) ?? null : null;
   }, [inspectedCode, model.nodesByCode, session?.current_target_standard_code]);
-
-  const pathCodes = useMemo(
-    () => new Set(session?.current_path_codes || []),
-    [session?.current_path_codes],
+  const inspectedIxl = useMemo(
+    () => findIxlStandard(ixl, inspectedNode?.code),
+    [inspectedNode, ixl],
   );
-  const changedCodes = useMemo(
-    () => new Set(session?.changed_codes || []),
-    [session?.changed_codes],
-  );
-  const highlightUuids = useMemo(() => new Set<string>(), []);
   const modeMeta = useMemo(
     () => new Map(adaptive.modes.map((mode) => [mode.id, mode])),
     [adaptive.modes],
@@ -111,6 +158,381 @@ export default function DiagnosticSimulator({ graph, adaptive, initialGrade }: P
   }, []);
 
   const currentCandidate = session?.current_recommendation ?? null;
+  const currentIxlSkill = useMemo(
+    () => findIxlSkill(ixl, currentCandidate?.source_standard_code, currentCandidate?.skill_id),
+    [currentCandidate?.skill_id, currentCandidate?.source_standard_code, ixl],
+  );
+  const currentQuestionLevel = useMemo(() => {
+    if (!currentIxlSkill?.levels.length || !currentCandidate) return null;
+    return selectCurrentDiagnosticLevel(
+      currentIxlSkill,
+      currentCandidate,
+      session?.skill_state_by_key,
+    );
+  }, [currentCandidate, currentIxlSkill, session?.skill_state_by_key]);
+  const currentViewerUrl = useMemo(
+    () => (currentQuestionLevel ? buildIxlViewerUrl(currentQuestionLevel) : null),
+    [currentQuestionLevel],
+  );
+  const domainMastery = useMemo<DomainMasterySummary[]>(() => {
+    if (!session) return [];
+
+    const byDomain = new Map<
+      string,
+      {
+        standardCount: number;
+        masteryTotal: number;
+        confidenceTotal: number;
+        evidenceCount: number;
+        masteredCount: number;
+        weakCount: number;
+        unknownCount: number;
+        pressureTotal: number;
+      }
+    >();
+
+    for (const code of model.standardsByGrade.get(session.grade) || []) {
+      const node = model.nodesByCode.get(code);
+      const domain = node?.domain || 'Unknown';
+      const state = session.standard_state_by_code[code];
+      const status = session.status_by_code[code] || 'unknown';
+      const row =
+        byDomain.get(domain) ||
+        {
+          standardCount: 0,
+          masteryTotal: 0,
+          confidenceTotal: 0,
+          evidenceCount: 0,
+          masteredCount: 0,
+          weakCount: 0,
+          unknownCount: 0,
+          pressureTotal: 0,
+        };
+
+      row.standardCount += 1;
+      row.masteryTotal += state?.mastery ?? 0.5;
+      row.confidenceTotal += state?.confidence ?? 0;
+      row.evidenceCount += state?.evidenceCount ?? 0;
+      row.pressureTotal += Math.max(
+        state?.attention ?? 0,
+        state?.prerequisitePressure ?? 0,
+        state?.recoveryPressure ?? 0,
+      );
+      if (status === 'mastered') row.masteredCount += 1;
+      else if (status === 'unmastered') row.weakCount += 1;
+      else if (status === 'unknown') row.unknownCount += 1;
+
+      byDomain.set(domain, row);
+    }
+
+    return [...byDomain.entries()]
+      .map(([domain, row]) => ({
+        domain,
+        label: domainName(domain),
+        standardCount: row.standardCount,
+        mastery: row.standardCount ? row.masteryTotal / row.standardCount : 0,
+        confidence: row.standardCount ? row.confidenceTotal / row.standardCount : 0,
+        evidenceCount: row.evidenceCount,
+        masteredCount: row.masteredCount,
+        weakCount: row.weakCount,
+        unknownCount: row.unknownCount,
+        pressure: row.standardCount ? row.pressureTotal / row.standardCount : 0,
+      }))
+      .sort((a, b) => a.domain.localeCompare(b.domain, undefined, { numeric: true }));
+  }, [model.nodesByCode, model.standardsByGrade, session]);
+
+  const graphTab = (
+    <div className="diag-tab-panel diag-graph-panel">
+      <div className="diag-panel-head">
+        <div>
+          <h3>Standards Graph</h3>
+        </div>
+      </div>
+
+      {currentCandidate ? (
+        <div className="diag-graph-current-card">
+          <div className="diag-graph-current-head">
+            <div>
+              <div className="diag-kicker">Current skill probe</div>
+              <div className="diag-graph-current-code">
+                {currentCandidate.skill_code || currentCandidate.skill_id}
+              </div>
+              <div className="diag-graph-current-name">
+                {currentCandidate.skill_name || 'Unnamed skill'}
+              </div>
+            </div>
+            <div className="diag-graph-current-score">
+              <span>Selection score</span>
+              <strong>{formatAdaptivePercent(currentCandidate.selection_score)}</strong>
+            </div>
+          </div>
+
+          <div className="diag-graph-current-toolbar">
+            {currentQuestionLevel ? (
+              <span className="diag-current-level">
+                {currentQuestionLevel.label || formatIxlLevelMeta(currentQuestionLevel)}
+              </span>
+            ) : (
+              <span />
+            )}
+            {currentViewerUrl ? (
+              <a className="diag-current-open" href={currentViewerUrl} target="_blank" rel="noreferrer">
+                Open viewer
+                <ExternalLink size={14} />
+              </a>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      <DomainMasteryPanel
+        domains={domainMastery}
+        currentDomain={inspectedNode?.domain || currentCandidate?.target_standard_domain || null}
+      />
+
+      <div className="diag-legend">
+        <span className="diag-legend-item current">Current target</span>
+        <span className="diag-legend-item path">Suspected path</span>
+        <span className="diag-legend-item changed">Changed last step</span>
+        <span className="diag-legend-item mastered">Mastered</span>
+        <span className="diag-legend-item unmastered">Weak</span>
+        <span className="diag-legend-item mixed">Mixed</span>
+      </div>
+
+      <div className="diag-graph-scroll">
+        <DiagnosticGraphView
+          graph={graph}
+          currentTargetCode={session?.current_target_standard_code ?? null}
+          currentSourceCode={currentCandidate?.source_standard_code ?? null}
+          pathCodes={session?.current_path_codes || []}
+          changedCodes={session?.changed_codes || []}
+          retainedCodes={session?.session_seen_codes || []}
+          leaderboard={session?.leaderboard || []}
+          statusByCode={session?.status_by_code || {}}
+          onSelectNode={setInspectedCode}
+        />
+      </div>
+
+      {inspectedNode && (
+        <div className="diag-inspector">
+          <div className="diag-inspector-head">
+            <div>
+              <div className="diag-kicker">Inspected standard</div>
+              <div className="diag-standard-line">
+                <strong>{inspectedNode.code}</strong>
+                <span>
+                  Grade {inspectedNode.grade} · {domainName(inspectedNode.domain)}
+                </span>
+              </div>
+            </div>
+            {session?.current_target_standard_code &&
+              inspectedNode.code !== session.current_target_standard_code && (
+                <button type="button" onClick={() => setInspectedCode(null)}>
+                  Follow simulator target
+                </button>
+              )}
+          </div>
+          {inspectedNode.description && <p>{plainifyDescription(inspectedNode.description)}</p>}
+          <GraphInspectorSkills
+            standard={inspectedIxl}
+            currentSkillId={
+              currentCandidate?.source_standard_code === inspectedNode.code
+                ? currentCandidate.skill_id
+                : null
+            }
+            currentLevel={currentQuestionLevel}
+            currentViewerUrl={currentViewerUrl}
+          />
+        </div>
+      )}
+    </div>
+  );
+
+  const currentTab = (
+    <div className="diag-tab-panel">
+      <div className="diag-panel-head">
+        <div>
+          <h3>Current Skill Probe</h3>
+        </div>
+      </div>
+
+      <div className="diag-panel-scroll">
+        {currentCandidate ? (
+          <CurrentProbeCard
+            candidate={currentCandidate}
+            hypothesis={session?.current_hypothesis || null}
+            modeLabel={modeMeta.get(currentCandidate.mode)?.label ?? currentCandidate.mode}
+            onOutcome={handleOutcome}
+            branchPreview={session?.branch_preview || []}
+            questionLevelLabel={currentQuestionLevel?.label ?? null}
+            viewerUrl={currentViewerUrl}
+          />
+        ) : (
+          <div className="diag-empty">
+            No current skill is available for this grade. That usually means the current data
+            slice has no adaptive candidates to show.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  const whyTab = (
+    <div className="diag-tab-panel">
+      <div className="diag-panel-head">
+        <div>
+          <h3>Why This Skill Won</h3>
+        </div>
+      </div>
+
+      <div className="diag-panel-scroll">
+        {currentCandidate ? (
+          <>
+            <div className="diag-why-card">
+              <div className="diag-subhead">
+                <h5>Current decision factors</h5>
+                <span>{formatAdaptivePercent(currentCandidate.selection_score)} selection score</span>
+              </div>
+              <MetricRow label="Target need" value={currentCandidate.influences.target_need} />
+              <MetricRow label="Skill prior" value={currentCandidate.influences.artifact_priority} />
+              <MetricRow
+                label="Uncertainty gain"
+                value={currentCandidate.influences.uncertainty_gain}
+              />
+              <MetricRow
+                label="Follow-up pressure"
+                value={currentCandidate.influences.followup_pressure}
+              />
+              <MetricRow label="Source signal" value={currentCandidate.influences.source_signal} />
+              <MetricRow
+                label="Domain coverage"
+                value={currentCandidate.influences.domain_coverage}
+              />
+            </div>
+
+            <div className="diag-why-card">
+              <div className="diag-subhead">
+                <h5>Influence summary</h5>
+                <span>{currentCandidate.reasons.length} active factors</span>
+              </div>
+              <ul className="diag-reasons">
+                {currentCandidate.reasons.map((reason) => (
+                  <li key={reason}>{reason}</li>
+                ))}
+              </ul>
+            </div>
+          </>
+        ) : null}
+
+        <div className="diag-why-card">
+          <div className="diag-subhead">
+            <h5>Top candidates</h5>
+            <span>{session?.leaderboard.length ?? 0} shown</span>
+          </div>
+          <div className="diag-leaderboard">
+            {(session?.leaderboard || []).map((candidate, index) => (
+              <CandidateCard
+                key={`${candidate.target_standard_code}:${candidate.source_standard_code}:${candidate.skill_id}`}
+                candidate={candidate}
+                index={index}
+                current={
+                  currentCandidate
+                    ? candidate.target_standard_code === currentCandidate.target_standard_code &&
+                      candidate.source_standard_code === currentCandidate.source_standard_code &&
+                      candidate.skill_id === currentCandidate.skill_id
+                    : false
+                }
+                modeLabel={modeMeta.get(candidate.mode)?.label ?? candidate.mode}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  const historyTab = (
+    <div className="diag-tab-panel">
+      <div className="diag-panel-head">
+        <div>
+          <h3>Session Timeline</h3>
+        </div>
+      </div>
+
+      {session?.history.length ? (
+        <div className="diag-history-list">
+          {session.history.map((entry) => (
+            <button
+              key={entry.step}
+              type="button"
+              className="diag-history-item"
+              onClick={() => handleReplayFrom(entry.step)}
+            >
+              <div className="diag-history-top">
+                <div className="diag-history-step">Step {entry.step}</div>
+                <div className={`diag-outcome-tag ${entry.outcome}`}>{entry.outcome_label}</div>
+              </div>
+              <div className="diag-history-main">
+                <strong>{entry.candidate.skill_code || entry.candidate.skill_id}</strong>
+                <span>
+                  {entry.candidate.target_standard_code} via {entry.candidate.source_standard_code}
+                </span>
+              </div>
+              <p>{entry.summary}</p>
+              <div className="diag-history-meta">
+                {entry.changed_codes.map((code) => (
+                  <span key={code}>{code}</span>
+                ))}
+              </div>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div className="diag-empty">
+          No simulated answers yet. Pick a Grade, start the session, then mark the current skill
+          as correct or incorrect to watch the algorithm move.
+        </div>
+      )}
+    </div>
+  );
+
+  const tabs: DiagnosticWorkbenchTab[] = useMemo(
+    () => [
+      {
+        id: 'question',
+        label: 'Question',
+        content: (
+          <DiagnosticQuestionSurface
+            candidate={currentCandidate}
+            skill={currentIxlSkill}
+            selectedLevel={currentQuestionLevel}
+            onOutcome={handleOutcome}
+          />
+        ),
+      },
+      {
+        id: 'current',
+        label: 'Current Skill Probe',
+        content: currentTab,
+      },
+      {
+        id: 'why',
+        label: 'Why This Skill Won',
+        content: whyTab,
+      },
+      {
+        id: 'history',
+        label: 'Session Timeline',
+        content: historyTab,
+      },
+      {
+        id: 'graph',
+        label: 'Standards Graph',
+        content: graphTab,
+      },
+    ],
+    [currentCandidate, currentIxlSkill, currentQuestionLevel, currentTab, graphTab, historyTab, whyTab],
+  );
 
   return (
     <>
@@ -163,213 +585,10 @@ export default function DiagnosticSimulator({ graph, adaptive, initialGrade }: P
         </div>
       </div>
 
-      <div className="diag-sim-shell">
-        <section className="diag-sim-panel diag-sim-graph">
-          <div className="diag-panel-head">
-            <div>
-              <h3>Standards Graph</h3>
-              <p>
-                The simulator starts from Grade {sessionGrade} and chooses skills across the full
-                grade-level pool. Older standards only surface when the current evidence points
-                toward a prerequisite gap.
-              </p>
-            </div>
-          </div>
-
-          <div className="diag-legend">
-            <span className="diag-legend-item current">Current target</span>
-            <span className="diag-legend-item path">Suspected path</span>
-            <span className="diag-legend-item changed">Changed last step</span>
-            <span className="diag-legend-item mastered">Mastered</span>
-            <span className="diag-legend-item unmastered">Weak</span>
-            <span className="diag-legend-item mixed">Mixed</span>
-          </div>
-
-          <div className="diag-graph-scroll">
-            <CoherenceGrid
-              graph={graph}
-              focusCode={session?.current_target_standard_code ?? null}
-              highlightUuids={highlightUuids}
-              onSelect={setInspectedCode}
-              statusByCode={session?.status_by_code}
-              pathCodes={pathCodes}
-              changedCodes={changedCodes}
-            />
-          </div>
-
-          {inspectedNode && (
-            <div className="diag-inspector">
-              <div className="diag-inspector-head">
-                <div>
-                  <div className="diag-kicker">Inspected standard</div>
-                  <div className="diag-standard-line">
-                    <strong>{inspectedNode.code}</strong>
-                    <span>
-                      Grade {inspectedNode.grade} · {domainName(inspectedNode.domain)}
-                    </span>
-                  </div>
-                </div>
-                {session?.current_target_standard_code &&
-                  inspectedNode.code !== session.current_target_standard_code && (
-                    <button type="button" onClick={() => setInspectedCode(null)}>
-                      Follow simulator target
-                    </button>
-                  )}
-              </div>
-              {inspectedNode.description && (
-                <p>{plainifyDescription(inspectedNode.description)}</p>
-              )}
-            </div>
-          )}
-        </section>
-
-        <section className="diag-sim-panel diag-sim-current">
-          <div className="diag-panel-head">
-            <div>
-              <h3>Current Skill Probe</h3>
-              <p>This is the skill the engine would present now based on the current session state.</p>
-            </div>
-          </div>
-
-          {currentCandidate ? (
-            <CurrentProbeCard
-              candidate={currentCandidate}
-              hypothesis={session?.current_hypothesis || null}
-              modeLabel={modeMeta.get(currentCandidate.mode)?.label ?? currentCandidate.mode}
-              onOutcome={handleOutcome}
-              branchPreview={session?.branch_preview || []}
-            />
-          ) : (
-            <div className="diag-empty">
-              No current skill is available for this grade. That usually means the current data
-              slice has no adaptive candidates to show.
-            </div>
-          )}
-        </section>
-
-        <section className="diag-sim-panel diag-sim-why">
-          <div className="diag-panel-head">
-            <div>
-              <h3>Why This Skill Won</h3>
-              <p>
-                The leaderboard below shows the strongest competing skills and what pushed the
-                current winner above them.
-              </p>
-            </div>
-          </div>
-
-          {currentCandidate ? (
-            <>
-              <div className="diag-why-card">
-                <div className="diag-subhead">
-                  <h5>Current decision factors</h5>
-                  <span>{formatAdaptivePercent(currentCandidate.selection_score)} selection score</span>
-                </div>
-                <MetricRow label="Target need" value={currentCandidate.influences.target_need} />
-                <MetricRow
-                  label="Skill prior"
-                  value={currentCandidate.influences.artifact_priority}
-                />
-                <MetricRow
-                  label="Uncertainty gain"
-                  value={currentCandidate.influences.uncertainty_gain}
-                />
-                <MetricRow
-                  label="Follow-up pressure"
-                  value={currentCandidate.influences.followup_pressure}
-                />
-                <MetricRow
-                  label="Source signal"
-                  value={currentCandidate.influences.source_signal}
-                />
-              </div>
-
-              <div className="diag-why-card">
-                <div className="diag-subhead">
-                  <h5>Influence summary</h5>
-                  <span>{currentCandidate.reasons.length} active factors</span>
-                </div>
-                <ul className="diag-reasons">
-                  {currentCandidate.reasons.map((reason) => (
-                    <li key={reason}>{reason}</li>
-                  ))}
-                </ul>
-              </div>
-            </>
-          ) : null}
-
-          <div className="diag-why-card">
-            <div className="diag-subhead">
-              <h5>Top candidates</h5>
-              <span>{session?.leaderboard.length ?? 0} shown</span>
-            </div>
-            <div className="diag-leaderboard">
-              {(session?.leaderboard || []).map((candidate, index) => (
-                <CandidateCard
-                  key={`${candidate.target_standard_code}:${candidate.source_standard_code}:${candidate.skill_id}`}
-                  candidate={candidate}
-                  index={index}
-                  current={
-                    currentCandidate
-                      ? candidate.target_standard_code === currentCandidate.target_standard_code &&
-                        candidate.source_standard_code === currentCandidate.source_standard_code &&
-                        candidate.skill_id === currentCandidate.skill_id
-                      : false
-                  }
-                  modeLabel={modeMeta.get(candidate.mode)?.label ?? candidate.mode}
-                />
-              ))}
-            </div>
-          </div>
-        </section>
-
-        <section className="diag-sim-panel diag-sim-history">
-          <div className="diag-panel-head">
-            <div>
-              <h3>Session Timeline</h3>
-              <p>
-                Each row is one simulated learner intervention. Click a row to restore the
-                simulator to that exact point and try a different path.
-              </p>
-            </div>
-          </div>
-
-          {session?.history.length ? (
-            <div className="diag-history-list">
-              {session.history.map((entry) => (
-                <button
-                  key={entry.step}
-                  type="button"
-                  className="diag-history-item"
-                  onClick={() => handleReplayFrom(entry.step)}
-                >
-                  <div className="diag-history-top">
-                    <div className="diag-history-step">Step {entry.step}</div>
-                    <div className={`diag-outcome-tag ${entry.outcome}`}>{entry.outcome_label}</div>
-                  </div>
-                  <div className="diag-history-main">
-                    <strong>{entry.candidate.skill_code || entry.candidate.skill_id}</strong>
-                    <span>
-                      {entry.candidate.target_standard_code} via {entry.candidate.source_standard_code}
-                    </span>
-                  </div>
-                  <p>{entry.summary}</p>
-                  <div className="diag-history-meta">
-                    {entry.changed_codes.map((code) => (
-                      <span key={code}>{code}</span>
-                    ))}
-                  </div>
-                </button>
-              ))}
-            </div>
-          ) : (
-            <div className="diag-empty">
-              No simulated answers yet. Pick a Grade, start the session, then mark the current
-              skill as correct or incorrect to watch the algorithm move.
-            </div>
-          )}
-        </section>
-      </div>
+      <DockableDiagnosticShell
+        tabs={tabs}
+        defaultLayout={DIAGNOSTIC_WORKBENCH_DEFAULT}
+      />
     </>
   );
 }
@@ -380,12 +599,16 @@ function CurrentProbeCard({
   modeLabel,
   onOutcome,
   branchPreview,
+  questionLevelLabel,
+  viewerUrl,
 }: {
   candidate: DiagnosticCandidateView;
   hypothesis: string | null;
   modeLabel: string;
   onOutcome: (outcome: DiagnosticOutcome) => void;
-  branchPreview: ReturnType<typeof simulateDiagnosticSession>['branch_preview'];
+  branchPreview: DiagnosticBranchPreview[];
+  questionLevelLabel: string | null;
+  viewerUrl: string | null;
 }) {
   return (
     <div className="diag-current-card">
@@ -400,6 +623,22 @@ function CurrentProbeCard({
           <strong>{formatAdaptivePercent(candidate.selection_score)}</strong>
         </div>
       </div>
+
+      {(questionLevelLabel || viewerUrl) && (
+        <div className="diag-current-toolbar">
+          {questionLevelLabel ? (
+            <span className="diag-current-level">{questionLevelLabel}</span>
+          ) : (
+            <span />
+          )}
+          {viewerUrl ? (
+            <a className="diag-current-open" href={viewerUrl} target="_blank" rel="noreferrer">
+              Open viewer
+              <ExternalLink size={14} />
+            </a>
+          ) : null}
+        </div>
+      )}
 
       <div className="diag-current-meta">
         <span>Target {candidate.target_standard_code}</span>
@@ -428,22 +667,51 @@ function CurrentProbeCard({
       <div className="diag-branch-block">
         <div className="diag-subhead">
           <h5>Branch preview</h5>
-          <span>What the engine would likely do next</span>
+          <span>The immediate next recommendation after this answer</span>
         </div>
         <div className="diag-branch-grid">
           {branchPreview.map((branch) => (
             <div key={branch.outcome} className="diag-branch-card">
-              <div className={`diag-outcome-tag ${branch.outcome}`}>{branch.label}</div>
+              <div className="diag-branch-card-head">
+                <div className={`diag-outcome-tag ${branch.outcome}`}>{branch.label}</div>
+                {branch.reasoning.length ? (
+                  <div className="diag-branch-info-wrap">
+                    <button
+                      type="button"
+                      className="diag-branch-info-button"
+                      aria-label={`Why ${branch.label} leads to this branch`}
+                    >
+                      <CircleHelp size={14} />
+                    </button>
+                    <div className="diag-branch-popover" role="tooltip">
+                      <div className="diag-branch-popover-title">
+                        Why this branch skill is selected
+                      </div>
+                      <ul className="diag-branch-popover-list">
+                        {branch.reasoning.map((reason) => (
+                          <li key={`${branch.outcome}:${reason}`}>{reason}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
               <div className="diag-branch-list">
-                {branch.skills.map((skill) => (
-                  <div key={`${branch.outcome}:${skill.target_standard_code}:${skill.skill_id}`}>
-                    <strong>{skill.skill_code || skill.skill_id}</strong>
+                {branch.next_recommendation ? (
+                  <div
+                    key={`${branch.outcome}:${branch.next_recommendation.target_standard_code}:${branch.next_recommendation.skill_id}`}
+                  >
+                    <strong>
+                      {branch.next_recommendation.skill_code || branch.next_recommendation.skill_id}
+                    </strong>
                     <span>
-                      {skill.target_standard_code} via {skill.source_standard_code}
+                      {branch.next_recommendation.target_standard_code} via{' '}
+                      {branch.next_recommendation.source_standard_code}
                     </span>
                   </div>
-                ))}
-                {!branch.skills.length && <span>No next skill available.</span>}
+                ) : (
+                  <span>No next skill available.</span>
+                )}
               </div>
             </div>
           ))}
@@ -506,6 +774,161 @@ function MetricRow({ label, value }: { label: string; value: number }) {
       <div className="diag-metric-bar">
         <span style={{ width: `${value * 100}%` }} />
       </div>
+    </div>
+  );
+}
+
+function DomainMasteryPanel({
+  domains,
+  currentDomain,
+}: {
+  domains: DomainMasterySummary[];
+  currentDomain: string | null;
+}) {
+  if (!domains.length) return null;
+
+  return (
+    <section className="diag-domain-panel">
+      <div className="diag-subhead">
+        <h5>Domain mastery</h5>
+        <span>{domains.length} domains</span>
+      </div>
+      <div className="diag-domain-matrix">
+        {domains.map((domain) => (
+          <div
+            key={domain.domain}
+            className={domain.domain === currentDomain ? 'diag-domain-row active' : 'diag-domain-row'}
+          >
+            <div className="diag-domain-title">
+              <span
+                className="diag-domain-swatch"
+                style={{ backgroundColor: domainColor(domain.domain) }}
+                aria-hidden="true"
+              />
+              <div className="diag-domain-title-text">
+                <div>
+                  <strong>{domain.domain}</strong>
+                  <span>{domain.label || domain.domain}</span>
+                </div>
+                <em>{domain.standardCount} standards</em>
+              </div>
+            </div>
+
+            <div className="diag-domain-measure">
+              <span>Mastery</span>
+              <strong>{formatAdaptivePercent(domain.mastery)}</strong>
+              <div className="diag-domain-bar">
+                <i style={{ width: `${domain.mastery * 100}%` }} />
+              </div>
+            </div>
+
+            <div className="diag-domain-measure">
+              <span>Confidence</span>
+              <strong>{formatAdaptivePercent(domain.confidence)}</strong>
+              <div className="diag-domain-bar">
+                <i style={{ width: `${domain.confidence * 100}%` }} />
+              </div>
+            </div>
+
+            <div className="diag-domain-measure compact">
+              <span>Evidence</span>
+              <strong>{domain.evidenceCount}</strong>
+            </div>
+
+            <div className="diag-domain-measure">
+              <span>Pressure</span>
+              <strong>{formatAdaptivePercent(domain.pressure)}</strong>
+              <div className="diag-domain-bar">
+                <i style={{ width: `${domain.pressure * 100}%` }} />
+              </div>
+            </div>
+
+            <div className="diag-domain-counts">
+              <span>M {domain.masteredCount}</span>
+              <span>W {domain.weakCount}</span>
+              <span>U {domain.unknownCount}</span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function GraphInspectorSkills({
+  standard,
+  currentSkillId,
+  currentLevel,
+  currentViewerUrl,
+}: {
+  standard: CoherenceIxlStandard | null;
+  currentSkillId: string | null;
+  currentLevel: CoherenceIxlStandard['skills'][number]['levels'][number] | null;
+  currentViewerUrl: string | null;
+}) {
+  return (
+    <div className="diag-inspector-skills">
+      <div className="diag-subhead">
+        <h5>Mapped skills</h5>
+        <span>{standard?.skill_count ?? 0} shown</span>
+      </div>
+
+      {!standard?.skills.length ? (
+        <div className="diag-empty diag-empty-compact">
+          No mapped IXL skills are attached to this standard in the current scrape.
+        </div>
+      ) : (
+        <div className="diag-inspector-skill-list">
+          {standard.skills.map((skill) => {
+            const isCurrent = currentSkillId === skill.skill_id;
+            const orderedLevels = sortIxlLevels(skill.levels);
+            const sampleLevel = isCurrent && currentLevel ? currentLevel : orderedLevels[0] ?? null;
+            const sampleUrl =
+              isCurrent && currentViewerUrl
+                ? currentViewerUrl
+                : sampleLevel
+                  ? buildIxlViewerUrl(sampleLevel)
+                  : null;
+
+            return (
+              <article
+                key={`${standard.standard_code}:${skill.skill_id}`}
+                className={isCurrent ? 'diag-inspector-skill active' : 'diag-inspector-skill'}
+              >
+                <div className="diag-inspector-skill-head">
+                  <div>
+                    <div className="diag-inspector-skill-code">
+                      {skill.skill_code || skill.skill_id}
+                    </div>
+                    <div className="diag-inspector-skill-name">
+                      {skill.skill_name || 'Unnamed skill'}
+                    </div>
+                  </div>
+                  {isCurrent ? <span className="diag-inspector-skill-current">Current</span> : null}
+                </div>
+
+                <div className="diag-inspector-skill-meta">
+                  <span>{skill.question_file_count} files</span>
+                  <span>{skill.num_levels} levels</span>
+                  <span>{skill.question_count} questions</span>
+                </div>
+
+                {sampleLevel ? (
+                  <div className="diag-inspector-skill-footer">
+                    <span>{sampleLevel.label || formatIxlLevelMeta(sampleLevel)}</span>
+                    {sampleUrl ? (
+                      <a href={sampleUrl} target="_blank" rel="noreferrer">
+                        Open sample
+                        <ExternalLink size={12} />
+                      </a>
+                    ) : null}
+                  </div>
+                ) : null}
+              </article>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
