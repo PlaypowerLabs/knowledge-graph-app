@@ -2,7 +2,7 @@
 
 import { startTransition, useCallback, useMemo, useState } from 'react';
 import Link from 'next/link';
-import { CircleHelp, ExternalLink, RotateCcw, Undo2 } from 'lucide-react';
+import { CircleHelp, Download, ExternalLink, RotateCcw, Undo2 } from 'lucide-react';
 import DiagnosticGraphView from '@/components/DiagnosticGraphView';
 import DockableDiagnosticShell, {
   type DiagnosticWorkbenchLayout,
@@ -54,6 +54,23 @@ type DomainMasterySummary = {
   weakCount: number;
   unknownCount: number;
   pressure: number;
+  band: 'below' | 'on' | 'above' | 'unknown';
+};
+
+const DOMAIN_BAND_LABEL: Record<DomainMasterySummary['band'], string> = {
+  unknown: '—',
+  below: 'Below',
+  on: 'On track',
+  above: 'Above',
+};
+
+// Map engine band → existing CSS class name (kept for backward compatibility
+// with the styles in globals.css).
+const DOMAIN_BAND_CLASS: Record<DomainMasterySummary['band'], string> = {
+  unknown: 'inconclusive',
+  below: 'below',
+  on: 'on-track',
+  above: 'above',
 };
 
 const DIAGNOSTIC_WORKBENCH_DEFAULT: DiagnosticWorkbenchLayout = {
@@ -157,6 +174,26 @@ export default function DiagnosticSimulator({ graph, adaptive, ixl, initialGrade
     });
   }, []);
 
+  const handleExportTimeline = useCallback(() => {
+    if (!session) return;
+    const payload = {
+      grade: session.grade,
+      exported_at: new Date().toISOString(),
+      events,
+      history: session.history,
+      summary: session.summary,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `diagnostic-session-grade-${session.grade}-${Date.now()}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }, [events, session]);
+
   const currentCandidate = session?.current_recommendation ?? null;
   const currentIxlSkill = useMemo(
     () => findIxlSkill(ixl, currentCandidate?.source_standard_code, currentCandidate?.skill_id),
@@ -177,17 +214,20 @@ export default function DiagnosticSimulator({ graph, adaptive, ixl, initialGrade
   const domainMastery = useMemo<DomainMasterySummary[]>(() => {
     if (!session) return [];
 
-    const byDomain = new Map<
+    // Aggregate per-standard signals that the engine doesn't surface at the
+    // domain level: pressure (attention / prereq / recovery) and counts of
+    // standards by mastery status. Mastery and confidence themselves come from
+    // the engine's domain-level posterior (session.domain_mastery), which
+    // correctly converges as items accumulate — averaging per-standard values
+    // would drag toward 0.5 for every untouched standard in the domain.
+    const perDomainExtras = new Map<
       string,
       {
-        standardCount: number;
-        masteryTotal: number;
-        confidenceTotal: number;
-        evidenceCount: number;
         masteredCount: number;
         weakCount: number;
         unknownCount: number;
         pressureTotal: number;
+        pressureSamples: number;
       }
     >();
 
@@ -197,47 +237,47 @@ export default function DiagnosticSimulator({ graph, adaptive, ixl, initialGrade
       const state = session.standard_state_by_code[code];
       const status = session.status_by_code[code] || 'unknown';
       const row =
-        byDomain.get(domain) ||
+        perDomainExtras.get(domain) ||
         {
-          standardCount: 0,
-          masteryTotal: 0,
-          confidenceTotal: 0,
-          evidenceCount: 0,
           masteredCount: 0,
           weakCount: 0,
           unknownCount: 0,
           pressureTotal: 0,
+          pressureSamples: 0,
         };
 
-      row.standardCount += 1;
-      row.masteryTotal += state?.mastery ?? 0.5;
-      row.confidenceTotal += state?.confidence ?? 0;
-      row.evidenceCount += state?.evidenceCount ?? 0;
       row.pressureTotal += Math.max(
         state?.attention ?? 0,
         state?.prerequisitePressure ?? 0,
         state?.recoveryPressure ?? 0,
       );
+      row.pressureSamples += 1;
       if (status === 'mastered') row.masteredCount += 1;
       else if (status === 'unmastered') row.weakCount += 1;
       else if (status === 'unknown') row.unknownCount += 1;
 
-      byDomain.set(domain, row);
+      perDomainExtras.set(domain, row);
     }
 
-    return [...byDomain.entries()]
-      .map(([domain, row]) => ({
-        domain,
-        label: domainName(domain),
-        standardCount: row.standardCount,
-        mastery: row.standardCount ? row.masteryTotal / row.standardCount : 0,
-        confidence: row.standardCount ? row.confidenceTotal / row.standardCount : 0,
-        evidenceCount: row.evidenceCount,
-        masteredCount: row.masteredCount,
-        weakCount: row.weakCount,
-        unknownCount: row.unknownCount,
-        pressure: row.standardCount ? row.pressureTotal / row.standardCount : 0,
-      }))
+    return session.domain_mastery
+      .map((snap) => {
+        const extras = perDomainExtras.get(snap.domain);
+        return {
+          domain: snap.domain,
+          label: domainName(snap.domain),
+          standardCount: snap.standard_count,
+          mastery: snap.mastery,
+          confidence: snap.confidence,
+          evidenceCount: snap.evidence_count,
+          masteredCount: extras?.masteredCount ?? 0,
+          weakCount: extras?.weakCount ?? 0,
+          unknownCount: extras?.unknownCount ?? 0,
+          pressure: extras && extras.pressureSamples
+            ? extras.pressureTotal / extras.pressureSamples
+            : 0,
+          band: snap.band,
+        };
+      })
       .sort((a, b) => a.domain.localeCompare(b.domain, undefined, { numeric: true }));
   }, [model.nodesByCode, model.standardsByGrade, session]);
 
@@ -454,8 +494,18 @@ export default function DiagnosticSimulator({ graph, adaptive, ixl, initialGrade
   const historyTab = (
     <div className="diag-tab-panel">
       <div className="diag-panel-head">
-        <div>
+        <div className="diag-panel-head-bar">
           <h3>Session Timeline</h3>
+          <button
+            type="button"
+            className="diag-export-button"
+            onClick={handleExportTimeline}
+            disabled={!session?.history.length}
+            title="Download session timeline as JSON"
+          >
+            <Download size={14} />
+            Export JSON
+          </button>
         </div>
       </div>
 
@@ -565,10 +615,16 @@ export default function DiagnosticSimulator({ graph, adaptive, ixl, initialGrade
         <div className="stats">
           {session ? (
             <>
-              Step {session.summary.current_step} · {session.summary.grade_standard_count} grade{' '}
-              {session.grade} standards · {session.summary.mastered_skill_count} mastered skills ·{' '}
-              {session.summary.unmastered_skill_count} weak skills ·{' '}
-              {session.summary.unknown_skill_count} unresolved skills in play
+              <span className="diag-step-pill">Step {session.summary.current_step}</span>
+              {domainMastery.map((d) => (
+                <span
+                  key={d.domain}
+                  className={`diag-domain-pill diag-band-${DOMAIN_BAND_CLASS[d.band]}`}
+                  title={`${d.label} · mastery ${(d.mastery * 100).toFixed(0)}% · ${d.evidenceCount} evidence`}
+                >
+                  <strong>{d.domain}</strong> {DOMAIN_BAND_LABEL[d.band]}
+                </span>
+              ))}
             </>
           ) : (
             'Loading simulator…'
