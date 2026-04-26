@@ -12,17 +12,17 @@ import type {
 } from '@/lib/coherenceAdaptive';
 
 const OUTCOME_META = {
-  correct: { label: 'Correct', observed: 1, confidence: 0.24 },
-  partial: { label: 'Partially correct', observed: 0.68, confidence: 0.18 },
-  unsure: { label: 'Unsure', observed: 0.42, confidence: 0.12 },
-  incorrect: { label: 'Incorrect', observed: 0.08, confidence: 0.24 },
+  correct: { label: 'Correct', observed: 1.0, confidence: 0.36 },
+  partial: { label: 'Partially correct', observed: 0.7, confidence: 0.22 },
+  unsure: { label: 'Unsure', observed: 0.3, confidence: 0.16 },
+  incorrect: { label: 'Incorrect', observed: 0.0, confidence: 0.36 },
 } as const;
 
 const OUTCOME_ORDER = ['correct', 'partial', 'unsure', 'incorrect'] as const;
 const FOLLOWUP_DECAY = 0.74;
 const PRESSURE_DECAY = 0.88;
 const STATUS_UNKNOWN_CONFIDENCE = 0.24;
-const STATUS_CONFIDENT = 0.42;
+const STATUS_CONFIDENT = 0.32;
 const FOLLOWUP_MAX_SCORE_GAP = 0.045;
 const MAX_CONSECUTIVE_TARGET_RUN = 2;
 
@@ -67,6 +67,15 @@ type SkillState = {
   lastOutcome: DiagnosticOutcome | null;
 };
 
+type DomainStateInternal = {
+  domain: string;
+  grade: string;
+  mastery: number;
+  confidence: number;
+  directEvidenceCount: number;
+  indirectEvidenceCount: number;
+};
+
 export type DiagnosticSkillSnapshot = {
   key: string;
   skill_id: string;
@@ -102,6 +111,18 @@ export type DiagnosticBranchPreview = {
   reasoning: string[];
 };
 
+export type DiagnosticDomainMasterySnapshot = {
+  domain: string;
+  standard_count: number;
+  mastery: number;
+  mastery_raw: number;
+  confidence: number;
+  evidence_count: number;
+  direct_evidence_count: number;
+  indirect_evidence_count: number;
+  band: 'below' | 'on' | 'above' | 'unknown';
+};
+
 export type DiagnosticHistoryEntry = {
   step: number;
   outcome: DiagnosticOutcome;
@@ -114,6 +135,7 @@ export type DiagnosticHistoryEntry = {
   summary: string;
   next_target_standard_code: string | null;
   next_skill_label: string | null;
+  domain_mastery: DiagnosticDomainMasterySnapshot[];
 };
 
 export type DiagnosticSessionSummary = {
@@ -123,6 +145,12 @@ export type DiagnosticSessionSummary = {
   mastered_skill_count: number;
   unmastered_skill_count: number;
   unknown_skill_count: number;
+};
+
+export type DiagnosticOverallSnapshot = {
+  mastery: number;
+  confidence: number;
+  band: 'below' | 'on' | 'above' | 'unknown';
 };
 
 export type DiagnosticSessionView = {
@@ -135,6 +163,8 @@ export type DiagnosticSessionView = {
   branch_preview: DiagnosticBranchPreview[];
   history: DiagnosticHistoryEntry[];
   summary: DiagnosticSessionSummary;
+  domain_mastery: DiagnosticDomainMasterySnapshot[];
+  overall: DiagnosticOverallSnapshot;
   status_by_code: Record<string, DiagnosticStandardStatus>;
   standard_state_by_code: Record<string, StandardState>;
   skill_state_by_key: Record<string, DiagnosticSkillSnapshot>;
@@ -160,6 +190,7 @@ type DomainCoverageContext = {
   domainEvidenceByDomain: Map<string, number>;
   domainStandardCountByDomain: Map<string, number>;
   domainCoverageGapByDomain: Map<string, number>;
+  domainOverAllocationByDomain: Map<string, number>;
 };
 
 type SimulationOptions = {
@@ -361,6 +392,9 @@ function recentTargetCount(recentTargetCodes: string[], code: string) {
   return recentTargetCodes.filter((targetCode) => targetCode === code).length;
 }
 
+// Domains that should not be content-balanced (Mathematical Practices, etc.)
+const NON_CONTENT_DOMAINS = new Set(['MP']);
+
 function buildDomainCoverageContext(
   model: DiagnosticModel,
   grade: string,
@@ -373,22 +407,68 @@ function buildDomainCoverageContext(
   for (const code of model.standardsByGrade.get(grade) || []) {
     const node = model.nodesByCode.get(code);
     const domain = domainKey(node?.domain);
+    if (NON_CONTENT_DOMAINS.has(domain)) continue;
     const state = getOrCreateStandardState(model, standardStates, code);
     domainStandardCountByDomain.set(domain, (domainStandardCountByDomain.get(domain) || 0) + 1);
     domainEvidenceByDomain.set(domain, (domainEvidenceByDomain.get(domain) || 0) + state.directEvidenceCount);
   }
 
-  for (const [domain, standardCount] of domainStandardCountByDomain) {
-    const evidenceCount = domainEvidenceByDomain.get(domain) || 0;
-    const targetSamples = Math.min(2, Math.max(1, Math.ceil(standardCount / 6)));
-    domainCoverageGapByDomain.set(domain, clamp((targetSamples - evidenceCount) / targetSamples));
+  // Self-balancing item allocation across content domains:
+  //   - Zero-evidence content domains get a maximal gap so each content domain
+  //     gets at least one probe before any single domain is dived into.
+  //   - Below-mean domains get a proportional boost.
+  //   - Above-mean domains get an over-allocation penalty so the engine moves
+  //     on instead of stacking probes on the same domain.
+  let totalEvidence = 0;
+  let domainCount = 0;
+  for (const evidence of domainEvidenceByDomain.values()) {
+    totalEvidence += evidence;
+    domainCount += 1;
+  }
+  const meanEvidence = domainCount > 0 ? totalEvidence / domainCount : 0;
+  const target = Math.max(meanEvidence, 0.5);
+  const domainOverAllocationByDomain = new Map<string, number>();
+  for (const [domain, evidenceCount] of domainEvidenceByDomain) {
+    if (evidenceCount === 0) {
+      domainCoverageGapByDomain.set(domain, 1.0);
+      domainOverAllocationByDomain.set(domain, 0);
+      continue;
+    }
+    const under = Math.max(0, target - evidenceCount + 1) / (target + 1);
+    domainCoverageGapByDomain.set(domain, clamp(under));
+    const over = Math.max(0, evidenceCount - target) / Math.max(target, 1);
+    domainOverAllocationByDomain.set(domain, clamp(over));
   }
 
   return {
     domainEvidenceByDomain,
     domainStandardCountByDomain,
     domainCoverageGapByDomain,
+    domainOverAllocationByDomain,
   };
+}
+
+// When a domain's posterior mastery climbs into the upper-mid range, prefer
+// more complex probes within that domain (skills with deeper level ladders;
+// standards higher in the prerequisite chain). The student is clearly above
+// the foundational items, but not yet so saturated that we should jump grades.
+const COMPLEXITY_RAMP_FLOOR = 0.62; // mastery at which complexity preference activates
+const COMPLEXITY_RAMP_CEIL = 0.85; // mastery at which preference is at full strength
+
+function complexityRampFactor(domainMastery: number): number {
+  if (domainMastery <= COMPLEXITY_RAMP_FLOOR) return 0;
+  if (domainMastery >= COMPLEXITY_RAMP_CEIL) return 1;
+  return (domainMastery - COMPLEXITY_RAMP_FLOOR) / (COMPLEXITY_RAMP_CEIL - COMPLEXITY_RAMP_FLOOR);
+}
+
+function getDomainMastery(
+  domainStates: Map<string, DomainStateInternal>,
+  grade: string,
+  domain: string | null,
+): number {
+  if (!domain) return 0.5;
+  const state = domainStates.get(`${grade}:${domain}`);
+  return state ? state.mastery : 0.5;
 }
 
 function standardNeedScore(
@@ -399,6 +479,7 @@ function standardNeedScore(
   coverage: DomainCoverageContext,
   recentTargetCodes: string[],
   recentTargetDomains: string[],
+  domainMastery: number,
 ) {
   const sameGrade = plan.focus_grade === grade;
   const unknown = state.evidenceCount === 0 ? 1 : 0;
@@ -409,6 +490,9 @@ function standardNeedScore(
   const impact = plan.descendant_standard_count ? clamp(plan.descendant_standard_count / 12) : 0;
   const domainCoverage = sameGrade
     ? coverage.domainCoverageGapByDomain.get(domainKey(plan.focus_domain)) || 0
+    : 0;
+  const domainOverAllocation = sameGrade
+    ? coverage.domainOverAllocationByDomain.get(domainKey(plan.focus_domain)) || 0
     : 0;
   const consecutiveTargetRun = trailingTargetRun(recentTargetCodes, plan.focus_standard_code);
   const recentTargetPressure = recentTargetCount(recentTargetCodes.slice(-6), plan.focus_standard_code);
@@ -428,34 +512,57 @@ function standardNeedScore(
   const repeatPenalty =
     consecutiveTargetRun
       ? Math.min(
-          0.28,
-          (followup >= 0.35 ? 0.05 : 0.1) * consecutiveTargetRun +
-            0.035 * recentTargetPressure,
+          0.45,
+          (followup >= 0.35 ? 0.12 : 0.18) * consecutiveTargetRun +
+            0.05 * recentTargetPressure,
         )
       : 0;
   const measuredPenalty =
     sameGrade && state.directEvidenceCount > 0 && state.confidence >= STATUS_CONFIDENT && followup < 0.24
       ? 0.16
       : 0;
+  // Allow consecutive same-domain probes when the domain is still under-allocated
+  // (e.g., a small domain like NBT with only 3 standards needs to be revisited).
+  const allowConsecutiveDomain = domainCoverage > 0.4;
   const domainRepeatPenalty =
-    sameGrade && domainCoverage < 0.9
-      ? Math.min(0.32, 0.08 * consecutiveDomainRun + 0.05 * recentDomainPressure)
+    sameGrade && consecutiveDomainRun && !allowConsecutiveDomain
+      ? Math.min(0.4, 0.12 * consecutiveDomainRun + 0.06 * recentDomainPressure)
       : 0;
+  const prereqPressureBoost =
+    !sameGrade && state.prerequisitePressure >= 0.2 ? 0.32 : 0;
+
+  // Standard-level complexity preference. When the student's domain mastery is
+  // climbing into the upper-mid range, prefer plans whose target standard sits
+  // higher in the prerequisite chain (more ancestors, fewer descendants — i.e.
+  // not foundational). Conversely, dampen the foundational-impact bonus, which
+  // would otherwise keep the engine cycling through introductory standards.
+  // Magnitudes are deliberately small: this is a tiebreaker among similarly-
+  // scoring candidates, not a dominant axis. Larger values regress placement
+  // accuracy on personas where domain mastery is borderline.
+  const complexityRamp = sameGrade ? complexityRampFactor(domainMastery) : 0;
+  const ancestorComplexity = plan.ancestor_standard_count
+    ? clamp(plan.ancestor_standard_count / 12)
+    : 0;
+  const standardComplexityBoost = 0.16 * complexityRamp * ancestorComplexity;
+  const foundationalImpactBoost = (1 - 0.85 * complexityRamp) * 0.05 * impact;
 
   return round(
     clamp(
-      (sameGrade ? 0.14 : 0.05) +
-        0.15 * unknown +
-        0.1 * directUnknown +
-        0.17 * uncertainty +
+      (sameGrade ? 0.12 : 0.04) +
+        0.12 * unknown +
+        0.08 * directUnknown +
+        0.15 * uncertainty +
         0.15 * weakness +
-        0.1 * followup +
-        0.05 * impact +
-        0.35 * domainCoverage +
+        0.2 * followup +
+        foundationalImpactBoost +
+        0.6 * domainCoverage +
+        standardComplexityBoost +
+        prereqPressureBoost +
         revisitBoost -
         repeatPenalty -
         measuredPenalty -
-        domainRepeatPenalty,
+        domainRepeatPenalty -
+        0.55 * domainOverAllocation,
     ),
   );
 }
@@ -470,6 +577,7 @@ function candidateScore(
   skillState: SkillState,
   lastRecommendation: DiagnosticCandidateView | null,
   recentTargetCodes: string[],
+  domainMastery: number,
 ) {
   const uncertaintyGain = clamp(1 - Math.min(skillState.confidence, 0.9));
   const followupPressure =
@@ -488,18 +596,45 @@ function candidateScore(
       : 0;
   const targetRun = trailingTargetRun(recentTargetCodes, targetState.code);
   const sameTargetPenalty =
-    targetRun ? Math.min(0.22, (followupPressure >= 0.36 ? 0.045 : 0.075) * targetRun) : 0;
+    targetRun ? Math.min(0.4, (followupPressure >= 0.36 ? 0.12 : 0.16) * targetRun) : 0;
+  const distancePenalty =
+    candidate.distance > 1 ? Math.min(0.5, 0.12 * (candidate.distance - 1)) : 0;
+  const gradeBack = Math.max(
+    0,
+    gradeRank(candidate.target_standard_grade) -
+      gradeRank(candidate.source_standard_grade),
+  );
+  const backwardGradePenalty = gradeBack >= 2 ? 0.18 : 0;
+  const ancestorWithoutFailure =
+    candidate.relation === 'ancestor' && targetState.prerequisitePressure < 0.18;
+  const noFailureSignalPenalty = ancestorWithoutFailure ? 0.32 : 0;
+
+  // Skill-level complexity preference. Within a standard, IXL skills vary in
+  // difficulty range (num_levels) and pool size (question_count). When the
+  // domain mastery is climbing, prefer skills with deeper level ladders so the
+  // student is pushed toward the higher end of the standard's content rather
+  // than reshown introductory items. Magnitude is small (a tiebreaker).
+  const complexityRamp = complexityRampFactor(domainMastery);
+  const skillLevelRichness = candidate.num_levels
+    ? clamp((candidate.num_levels - 2) / 5)
+    : 0;
+  const skillComplexityBoost = 0.12 * complexityRamp * skillLevelRichness;
 
   const selectionScore = round(
     clamp(
       0.3 * targetNeed +
-        0.24 * candidate.score +
+        0.14 * candidate.score +
+        0.1 * candidate.score_breakdown.graph_support +
         0.14 * uncertaintyGain +
         0.07 * followupPressure +
         0.04 * sourceSignal +
-        0.1 * domainCoverage -
+        0.25 * domainCoverage +
+        skillComplexityBoost -
         repeatPenalty -
-        sameTargetPenalty,
+        sameTargetPenalty -
+        distancePenalty -
+        backwardGradePenalty -
+        noFailureSignalPenalty,
     ),
   );
 
@@ -776,11 +911,20 @@ function cloneSkillStates(skillStates: Map<string, SkillState>) {
   return cloned;
 }
 
+function cloneDomainStates(domainStates: Map<string, DomainStateInternal>) {
+  const cloned = new Map<string, DomainStateInternal>();
+  for (const [key, state] of domainStates) {
+    cloned.set(key, { ...state });
+  }
+  return cloned;
+}
+
 function buildBranchPreview(
   model: DiagnosticModel,
   grade: string,
   standardStates: Map<string, StandardState>,
   skillStates: Map<string, SkillState>,
+  domainStates: Map<string, DomainStateInternal>,
   recommendation: DiagnosticCandidateView | null,
   recentTargetCodes: string[],
 ) {
@@ -789,10 +933,13 @@ function buildBranchPreview(
   return OUTCOME_ORDER.map((outcome) => {
     const branchStandardStates = cloneStandardStates(standardStates);
     const branchSkillStates = cloneSkillStates(skillStates);
+    const branchDomainStates = cloneDomainStates(domainStates);
     applyOutcome(
       model,
       branchStandardStates,
       branchSkillStates,
+      branchDomainStates,
+      grade,
       recommendation,
       outcome,
     );
@@ -803,6 +950,7 @@ function buildBranchPreview(
       grade,
       branchStandardStates,
       branchSkillStates,
+      branchDomainStates,
       recommendation,
       branchFollowupContext,
       branchRecentTargetCodes,
@@ -884,10 +1032,51 @@ function applyStandardObservation(
   else state.indirectEvidenceCount += 1;
 }
 
+const DOMAIN_DIRECT_WEIGHT = 0.24;
+const DOMAIN_INDIRECT_WEIGHT = 0.14;
+const DOMAIN_CONFIDENCE_DIRECT = 0.18;
+const DOMAIN_CONFIDENCE_INDIRECT = 0.09;
+
+function getOrCreateDomainState(
+  domainStates: Map<string, DomainStateInternal>,
+  grade: string,
+  domain: string,
+): DomainStateInternal {
+  const key = `${grade}:${domain}`;
+  const existing = domainStates.get(key);
+  if (existing) return existing;
+  const fresh: DomainStateInternal = {
+    domain,
+    grade,
+    mastery: 0.5,
+    confidence: 0,
+    directEvidenceCount: 0,
+    indirectEvidenceCount: 0,
+  };
+  domainStates.set(key, fresh);
+  return fresh;
+}
+
+function applyDomainObservation(
+  domainState: DomainStateInternal,
+  observed: number,
+  evidenceKind: 'direct' | 'indirect',
+) {
+  const masteryWeight = evidenceKind === 'direct' ? DOMAIN_DIRECT_WEIGHT : DOMAIN_INDIRECT_WEIGHT;
+  const confidenceDelta =
+    evidenceKind === 'direct' ? DOMAIN_CONFIDENCE_DIRECT : DOMAIN_CONFIDENCE_INDIRECT;
+  domainState.mastery = updatePosterior(domainState.mastery, observed, masteryWeight);
+  domainState.confidence = round(clamp(domainState.confidence + confidenceDelta));
+  if (evidenceKind === 'direct') domainState.directEvidenceCount += 1;
+  else domainState.indirectEvidenceCount += 1;
+}
+
 function applyOutcome(
   model: DiagnosticModel,
   standardStates: Map<string, StandardState>,
   skillStates: Map<string, SkillState>,
+  domainStates: Map<string, DomainStateInternal>,
+  grade: string,
   recommendation: DiagnosticCandidateView,
   outcome: DiagnosticOutcome,
 ) {
@@ -924,7 +1113,14 @@ function applyOutcome(
     if (observed < 0.5) {
       targetState.prerequisitePressure = round(clamp(targetState.prerequisitePressure + 0.26));
       targetState.recoveryPressure = round(targetState.recoveryPressure * 0.55);
-      boostAncestors(model, standardStates, targetState.code, 0.22);
+      boostAncestors(model, standardStates, targetState.code, 0.32);
+      for (const parent of model.reverse.get(targetState.code) || []) {
+        const parentState = getOrCreateStandardState(model, standardStates, parent);
+        parentState.prerequisitePressure = round(
+          clamp(parentState.prerequisitePressure + 0.22),
+        );
+        changed.add(parent);
+      }
     } else {
       targetState.prerequisitePressure = round(targetState.prerequisitePressure * 0.62);
       if (observed > 0.85) {
@@ -939,7 +1135,7 @@ function applyOutcome(
       sourceState.prerequisitePressure = round(clamp(sourceState.prerequisitePressure + 0.16));
       boostAncestors(model, standardStates, sourceState.code, 0.2);
     } else {
-      targetState.prerequisitePressure = round(targetState.prerequisitePressure * 0.55);
+      targetState.prerequisitePressure = round(targetState.prerequisitePressure * 0.85);
       targetState.recoveryPressure = round(clamp(targetState.recoveryPressure + 0.28));
       boostDescendants(model, standardStates, targetState.code, 0.18);
     }
@@ -953,6 +1149,18 @@ function applyOutcome(
     }
   }
 
+  // Domain-level posterior update. Each item is treated as evidence about the
+  // grade-level domain ability, with prerequisite/ancestor probes counted as
+  // indirect evidence (smaller weight).
+  const targetDomain = recommendation.target_standard_domain;
+  if (targetDomain) {
+    const isDirect =
+      recommendation.relation === 'focus' &&
+      recommendation.target_standard_grade === grade;
+    const domainState = getOrCreateDomainState(domainStates, grade, targetDomain);
+    applyDomainObservation(domainState, observed, isDirect ? 'direct' : 'indirect');
+  }
+
   return [...changed];
 }
 
@@ -961,6 +1169,7 @@ function computeRecommendationState(
   grade: string,
   standardStates: Map<string, StandardState>,
   skillStates: Map<string, SkillState>,
+  domainStates: Map<string, DomainStateInternal>,
   lastRecommendation: DiagnosticCandidateView | null,
   followupContext: FollowupContext | null,
   recentTargetCodes: string[],
@@ -986,6 +1195,7 @@ function computeRecommendationState(
   const leaderboard: DiagnosticCandidateView[] = [];
   const followupCandidates: DiagnosticCandidateView[] = [];
 
+  const userGradeRank = gradeRank(grade);
   for (const code of activeStandards) {
     const plan = model.plansByCode.get(code);
     if (!plan) continue;
@@ -994,8 +1204,12 @@ function computeRecommendationState(
     if (!sameGrade && targetState.attention < 0.12 && targetState.prerequisitePressure < 0.12) {
       continue;
     }
+    if (userGradeRank - gradeRank(plan.focus_grade) > 1) {
+      continue;
+    }
 
     const mode = determineMode(targetState, sameGrade);
+    const planDomainMastery = getDomainMastery(domainStates, grade, plan.focus_domain);
     const targetNeed = standardNeedScore(
       plan,
       targetState,
@@ -1004,6 +1218,7 @@ function computeRecommendationState(
       coverage,
       recentTargetCodes,
       recentTargetDomains,
+      planDomainMastery,
     );
     const domainCoverage = sameGrade
       ? coverage.domainCoverageGapByDomain.get(domainKey(plan.focus_domain)) || 0
@@ -1026,6 +1241,7 @@ function computeRecommendationState(
           skillState,
           lastRecommendation,
           recentTargetCodes,
+          planDomainMastery,
         );
 
         const followupBias =
@@ -1123,6 +1339,106 @@ function computeRecommendationState(
     pathCodes: recommendation ? buildPathCodes(model, recommendation) : [],
     targetStandardCode: recommendation?.target_standard_code ?? null,
   } satisfies RecommendationState;
+}
+
+const DOMAIN_BAND_BELOW = 0.4;
+const DOMAIN_BAND_ABOVE = 0.7;
+const DOMAIN_BAND_MIN_CONFIDENCE = 0.32;
+
+function classifyDomainBand(
+  mastery: number,
+  confidence: number,
+): 'below' | 'on' | 'above' | 'unknown' {
+  if (confidence < DOMAIN_BAND_MIN_CONFIDENCE) return 'unknown';
+  if (mastery < DOMAIN_BAND_BELOW) return 'below';
+  if (mastery > DOMAIN_BAND_ABOVE) return 'above';
+  return 'on';
+}
+
+// Haberman shrinkage parameters: how aggressively to pull a domain estimate
+// toward the overall ability when the domain has weak evidence. A small floor
+// preserves cross-domain signal even when evidence is plentiful; a moderate
+// ceiling stabilises low-evidence domains.
+const SHRINKAGE_FLOOR = 0.1;
+const SHRINKAGE_CEIL = 0.55;
+const SHRINKAGE_DECAY = 0.45;
+
+function summarizeDomainMastery(
+  model: DiagnosticModel,
+  grade: string,
+  domainStates: Map<string, DomainStateInternal>,
+): DiagnosticDomainMasterySnapshot[] {
+  const standardCounts = new Map<string, number>();
+  for (const code of model.standardsByGrade.get(grade) || []) {
+    const node = model.nodesByCode.get(code);
+    const domain = domainKey(node?.domain);
+    standardCounts.set(domain, (standardCounts.get(domain) || 0) + 1);
+  }
+
+  // First pass: collect raw per-domain values.
+  type Raw = {
+    domain: string;
+    standardCount: number;
+    rawMastery: number;
+    confidence: number;
+    directEvidence: number;
+    indirectEvidence: number;
+  };
+  const raws: Raw[] = [];
+  for (const [domain, standardCount] of standardCounts) {
+    const state = domainStates.get(`${grade}:${domain}`);
+    raws.push({
+      domain,
+      standardCount,
+      rawMastery: state ? state.mastery : 0.5,
+      confidence: state ? state.confidence : 0,
+      directEvidence: state ? state.directEvidenceCount : 0,
+      indirectEvidence: state ? state.indirectEvidenceCount : 0,
+    });
+  }
+
+  // Compute the overall ability across content domains, weighted by total
+  // evidence — this is the prior that low-confidence domains shrink toward.
+  let weightSum = 0;
+  let masteryWeighted = 0;
+  for (const r of raws) {
+    if (NON_CONTENT_DOMAINS.has(r.domain)) continue;
+    const evidence = r.directEvidence + 0.5 * r.indirectEvidence;
+    const weight = 1 + evidence;
+    weightSum += weight;
+    masteryWeighted += r.rawMastery * weight;
+  }
+  const overallMastery = weightSum > 0 ? masteryWeighted / weightSum : 0.5;
+
+  // Second pass: apply shrinkage. α decays smoothly with confidence — high
+  // confidence trusts the raw estimate, low confidence pulls toward overall.
+  // We deliberately do NOT dampen by raw-vs-overall divergence: that creates a
+  // non-monotonic artifact where a weak domain's shrunk mastery drifts
+  // downward as the student answers correctly on stronger domains (overall
+  // rises, divergence widens, damping reduces α toward raw, shrunk dips).
+  // Confidence-only shrinkage preserves monotonicity per domain.
+  const snapshots: DiagnosticDomainMasterySnapshot[] = [];
+  for (const r of raws) {
+    let mastery = r.rawMastery;
+    if (!NON_CONTENT_DOMAINS.has(r.domain)) {
+      const confidenceFactor = 1 - r.confidence; // 1=no info, 0=fully confident
+      const alpha = SHRINKAGE_FLOOR + (SHRINKAGE_CEIL - SHRINKAGE_FLOOR) * confidenceFactor;
+      mastery = alpha * overallMastery + (1 - alpha) * r.rawMastery;
+    }
+    snapshots.push({
+      domain: r.domain,
+      standard_count: r.standardCount,
+      mastery: round(mastery),
+      mastery_raw: round(r.rawMastery),
+      confidence: round(r.confidence),
+      evidence_count: r.directEvidence + r.indirectEvidence,
+      direct_evidence_count: r.directEvidence,
+      indirect_evidence_count: r.indirectEvidence,
+      band: classifyDomainBand(mastery, r.confidence),
+    });
+  }
+  snapshots.sort((a, b) => a.domain.localeCompare(b.domain));
+  return snapshots;
 }
 
 function summarizeSession(
@@ -1268,6 +1584,7 @@ export function simulateDiagnosticSession(
 ): DiagnosticSessionView {
   const standardStates = new Map<string, StandardState>();
   const skillStates = new Map<string, SkillState>();
+  const domainStates = new Map<string, DomainStateInternal>();
   const history: DiagnosticHistoryEntry[] = [];
 
   let lastRecommendation: DiagnosticCandidateView | null = null;
@@ -1281,6 +1598,7 @@ export function simulateDiagnosticSession(
       grade,
       standardStates,
       skillStates,
+      domainStates,
       lastRecommendation,
       followupContext,
       recentTargetCodes,
@@ -1292,6 +1610,8 @@ export function simulateDiagnosticSession(
       model,
       standardStates,
       skillStates,
+      domainStates,
+      grade,
       current.recommendation,
       outcome,
     );
@@ -1303,6 +1623,7 @@ export function simulateDiagnosticSession(
       grade,
       standardStates,
       skillStates,
+      domainStates,
       current.recommendation,
       nextFollowupContext,
       nextRecentTargetCodes,
@@ -1322,6 +1643,7 @@ export function simulateDiagnosticSession(
       next_skill_label: next.recommendation
         ? next.recommendation.skill_code || next.recommendation.skill_id
         : null,
+      domain_mastery: summarizeDomainMastery(model, grade, domainStates),
     });
 
     lastRecommendation = current.recommendation;
@@ -1334,6 +1656,7 @@ export function simulateDiagnosticSession(
     grade,
     standardStates,
     skillStates,
+    domainStates,
     lastRecommendation,
     followupContext,
     recentTargetCodes,
@@ -1356,9 +1679,13 @@ export function simulateDiagnosticSession(
           grade,
           standardStates,
           skillStates,
+          domainStates,
           current.recommendation,
           recentTargetCodes,
         );
+
+  const domainMastery = summarizeDomainMastery(model, grade, domainStates);
+  const overall = computeOverallSnapshot(domainMastery);
 
   return {
     grade,
@@ -1370,11 +1697,42 @@ export function simulateDiagnosticSession(
     branch_preview: branchPreview,
     history,
     summary,
+    domain_mastery: domainMastery,
+    overall,
     status_by_code: statusByCode,
     standard_state_by_code: stateByCode,
     skill_state_by_key: skillStateByKey,
     changed_codes: history.at(-1)?.changed_codes || changedCodes,
     session_seen_codes: [...sessionSeenCodes],
+  };
+}
+
+const CONTENT_DOMAIN_KEYS = new Set(['OA', 'NBT', 'NF', 'MD', 'G']);
+
+function computeOverallSnapshot(
+  domainMastery: DiagnosticDomainMasterySnapshot[],
+): DiagnosticOverallSnapshot {
+  // Mean of content-domain mastery weighted by (1 + total evidence count).
+  // Skip MP (Mathematical Practices) and any other non-content domain.
+  let weightSum = 0;
+  let masteryWeighted = 0;
+  let confidenceWeighted = 0;
+  for (const snap of domainMastery) {
+    if (!CONTENT_DOMAIN_KEYS.has(snap.domain)) continue;
+    const weight = 1 + snap.evidence_count;
+    weightSum += weight;
+    masteryWeighted += snap.mastery * weight;
+    confidenceWeighted += snap.confidence * weight;
+  }
+  if (weightSum === 0) {
+    return { mastery: 0.5, confidence: 0, band: 'unknown' };
+  }
+  const mastery = round(masteryWeighted / weightSum);
+  const confidence = round(confidenceWeighted / weightSum);
+  return {
+    mastery,
+    confidence,
+    band: classifyDomainBand(mastery, confidence),
   };
 }
 
